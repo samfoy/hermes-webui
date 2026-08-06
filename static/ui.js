@@ -5167,6 +5167,7 @@ function _reasoningEffortContext(){
     provider=_modelStateForSelect(sel, model).model_provider||'';
   }
   const ctx={};
+  if(S&&S.session&&S.session.session_id) ctx.session_id=S.session.session_id;
   if(model) ctx.model=model;
   if(provider) ctx.provider=provider;
   return ctx;
