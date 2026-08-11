@@ -15813,7 +15813,9 @@ def handle_post(handler, parsed) -> bool:
             return bad(handler, _sanitize_error(e), 500)
 
         try:
-            return j(handler, {"output": execute_plugin_command(command)})
+            return j(handler, {"output": execute_plugin_command(
+                command, session_id=str(body.get("session_id", "") or "")
+            )})
         except ValueError as e:
             return bad(handler, str(e), 400)
         except KeyError:

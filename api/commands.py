@@ -431,12 +431,18 @@ def resolve_moa_config(preset: str | None = None) -> dict:
     return resolved
 
 
-def execute_plugin_command(command: str) -> str:
+def execute_plugin_command(command: str, session_id: str = "") -> str:
     """Execute a plugin-registered slash command and return printable output.
 
     Unknown commands raise ``KeyError`` so the HTTP layer can return 404.
     Plugin handler failures are returned as output text instead of surfacing as
     transport errors, matching Hermes' existing slash-command UX.
+
+    ``session_id`` identifies the WebUI session that issued the command. It is
+    forwarded to the handler so per-session state (e.g. a mode toggle) is keyed
+    to the right conversation. Without it a handler falls back to
+    process-global ``os.environ``, which in a multi-session WebUI is whichever
+    session last ran a turn — so a toggle typed in one tab landed on another.
     """
 
     raw = str(command or "").strip()
@@ -453,7 +459,7 @@ def execute_plugin_command(command: str) -> str:
     try:
         from hermes_cli.plugins import (
             get_plugin_command_handler,
-            resolve_plugin_command_result,
+            invoke_plugin_command,
         )
     except ImportError as exc:
         logger.warning("Plugin command runtime unavailable", exc_info=True)
@@ -469,7 +475,9 @@ def execute_plugin_command(command: str) -> str:
         raise KeyError(cmd_base)
 
     try:
-        result = resolve_plugin_command_result(handler(cmd_arg))
+        result = invoke_plugin_command(
+            handler, cmd_arg, session_id=str(session_id or "")
+        )
         return str(result or "(no output)")
     except Exception as exc:
         # Don't leak raw exception str (paths, env, internal state) to the

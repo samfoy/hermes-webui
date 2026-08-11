@@ -435,9 +435,16 @@ async function executeAgentPluginCommand(text,_meta){
 async function _runAgentCommandTransport(text,_meta){
   const command=String(text||'').trim();
   if(!command) throw new Error('command is required');
+  // Send the active session id so plugin handlers that persist per-session
+  // state key it to THIS session. Without it the backend falls back to
+  // process-global env, which in a multi-session WebUI is whichever session
+  // last ran a turn — a toggle typed here would land on another session.
+  const payload={command};
+  const sid=S&&S.session&&S.session.session_id;
+  if(sid) payload.session_id=sid;
   const data=await api('/api/commands/exec',{
     method:'POST',
-    body:JSON.stringify({command})
+    body:JSON.stringify(payload)
   });
   return String(data&&data.output||'(no output)');
 }

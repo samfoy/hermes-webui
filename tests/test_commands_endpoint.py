@@ -242,6 +242,90 @@ def test_credits_command_renders_shared_credits_view(monkeypatch):
     )
 
 
+def test_commands_exec_forwards_session_id_to_plugin_command(monkeypatch):
+    """The POST route must forward session_id to the plugin command path.
+
+    Regression: without it, a plugin handler that persists per-session state
+    fell back to process-global env — in a multi-session WebUI that is
+    whichever session last ran a turn, so a mode toggled in one tab was
+    recorded against a different session and never took effect.
+    """
+
+    class _FakeHandler:
+        def __init__(self, body_bytes: bytes):
+            self.status = None
+            self.sent_headers = []
+            self.body = bytearray()
+            self.wfile = self
+            self.rfile = io.BytesIO(body_bytes)
+            self.headers = {"Content-Length": str(len(body_bytes))}
+            self.request = None
+
+        def send_response(self, status):
+            self.status = status
+
+        def send_header(self, name, value):
+            self.sent_headers.append((name, value))
+
+        def end_headers(self):
+            pass
+
+        def write(self, data):
+            self.body.extend(data)
+
+        def json_body(self):
+            return json.loads(bytes(self.body).decode("utf-8"))
+
+    import api.commands as commands
+    from api import routes
+
+    seen = {}
+
+    def _fake_execute_agent_command(command):
+        # Not an agent command; let the plugin path handle it.
+        raise KeyError(command)
+
+    def _fake_execute_plugin_command(command, session_id=""):
+        seen["command"] = command
+        seen["session_id"] = session_id
+        return "conductor mode ON"
+
+    monkeypatch.setattr(commands, "execute_agent_command", _fake_execute_agent_command)
+    monkeypatch.setattr(commands, "execute_plugin_command", _fake_execute_plugin_command)
+
+    raw = json.dumps(
+        {"command": "/conductor on", "session_id": "sess-typed-here"}
+    ).encode("utf-8")
+    handler = _FakeHandler(raw)
+    routes.handle_post(handler, SimpleNamespace(path="/api/commands/exec", query=""))
+
+    assert handler.status == 200
+    assert seen == {"command": "/conductor on", "session_id": "sess-typed-here"}
+    assert handler.json_body() == {"output": "conductor mode ON"}
+
+
+def test_execute_plugin_command_threads_session_id_to_handler(monkeypatch):
+    """execute_plugin_command must hand the session id to the plugin handler."""
+    import api.commands as commands
+
+    seen = {}
+
+    def _handler(raw_args, session_id=""):
+        seen["args"] = raw_args
+        seen["sid"] = session_id
+        return "ok"
+
+    import hermes_cli.plugins as plugins
+
+    monkeypatch.setattr(
+        plugins, "get_plugin_command_handler", lambda name: _handler
+    )
+
+    out = commands.execute_plugin_command("/conductor on", session_id="sess-Z")
+    assert out == "ok"
+    assert seen == {"args": "on", "sid": "sess-Z"}
+
+
 def test_commands_exec_routes_credits_through_agent_dispatch(monkeypatch):
     """`/credits` should go through the POST route's agent-command path, not the plugin fallback."""
 

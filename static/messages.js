@@ -1424,6 +1424,31 @@ async function send(){
             return;
           }
         }
+        // Plugin-registered slash commands must ALSO execute immediately while
+        // the agent is busy. They are host-side commands (they toggle modes,
+        // report status) and are not addressed to the model at all. Falling
+        // through sent the literal text (e.g. "/conductor status") to
+        // _trySteer, which rendered a STEER bubble and handed the raw string
+        // to the model as a mid-turn nudge — the command silently never ran.
+        if(_pc&&_pc.name&&typeof getAgentCommandMetadata==='function'){
+          let _busyPluginMeta=null;
+          try{ _busyPluginMeta=await getAgentCommandMetadata(_pc.name); }catch(_e){ _busyPluginMeta=null; }
+          if(_busyPluginMeta&&_busyPluginMeta.category==='Plugin'){
+            $('msg').value='';autoResize();
+            S.messages.push({role:'user',content:text,_ts:Date.now()/1000});
+            let _busyPluginOut='(no output)';
+            try{
+              _busyPluginOut=typeof executeAgentPluginCommand==='function'
+                ? await executeAgentPluginCommand(text,_busyPluginMeta)
+                : 'Plugin command runtime unavailable in WebUI.';
+            }catch(e){
+              _busyPluginOut=`Plugin command error: ${e&&e.message||e}`;
+            }
+            S.messages.push({role:'assistant',content:String(_busyPluginOut||'(no output)'),_ts:Date.now()/1000});
+            renderMessages();
+            return;
+          }
+        }
       }
     const defaultMessageMode=window._defaultMessageMode||'steer';
       if(defaultMessageMode==='steer'&&S.activeStreamId&&typeof _trySteer==='function'){
