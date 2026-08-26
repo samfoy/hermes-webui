@@ -197,6 +197,47 @@ def test_share_inliner_still_rejects_path_outside_allowed_roots(tmp_path):
     "text,label",
     [
         (
+            "MEDIA:https://cdn.test/i.png?w=800&fmt=webp",
+            "harmless public query string",
+        ),
+        (
+            "MEDIA:https://cdn.test/img/photo.png",
+            "ordinary public asset",
+        ),
+        (
+            "MEDIA:HTTPS://cdn.test/a/photo.png",
+            "uppercase scheme (schemes are case-insensitive)",
+        ),
+        (
+            'MEDIA:"https://cdn.test/q/spaced name.png"',
+            "quoted external URL",
+        ),
+        (
+            "MEDIA:https://cdn.test/i.png?next=/media/other.png",
+            "public query naming a non-MEDIA path",
+        ),
+    ],
+)
+def test_public_external_url_is_preserved_exactly(text, label):
+    """An exempt external token must survive byte-for-byte.
+
+    This is the preservation half of the whole-token decision: the scanner must
+    never resume inside an external token and rewrite its tail, and a harmless
+    public query string must not be mangled.
+    """
+    from api import shares
+
+    out = shares._embed_share_media(text, allowed_roots=())
+    assert out == text, f"{label}: external token was rewritten"
+    assert shares._PLACEHOLDER not in out, (
+        f"{label}: a local-path placeholder was spliced into an external URL"
+    )
+
+
+@pytest.mark.parametrize(
+    "text,label",
+    [
+        (
             "MEDIA:https://cdn.test/img/MEDIA:/etc/passwd.png",
             "nested MEDIA: in the URL path",
         ),
@@ -206,23 +247,92 @@ def test_share_inliner_still_rejects_path_outside_allowed_roots(tmp_path):
         ),
         (
             "MEDIA:HTTPS://cdn.test/a/MEDIA:/etc/passwd.png",
-            "uppercase scheme (schemes are case-insensitive)",
+            "uppercase scheme with a nested local ref",
         ),
         (
             'MEDIA:"https://cdn.test/q/MEDIA:/etc/passwd.png"',
-            "quoted external URL",
+            "quoted external URL with a nested local ref",
+        ),
+        (
+            "MEDIA:https://cdn.test/i.png#MEDIA:/etc/shadow.png",
+            "nested MEDIA: in the URL fragment",
+        ),
+        (
+            "MEDIA:https://cdn.test/i.png?src=file:///etc/shadow.png",
+            "file:// smuggled in the query",
+        ),
+        (
+            "MEDIA:https://cdn.test/i.png?src=%4dEDIA:/etc/shadow.png",
+            "percent-encoded MEDIA: (single decode)",
+        ),
+        (
+            "MEDIA:https://cdn.test/i.png?src=%254dEDIA:/etc/shadow.png",
+            "double-encoded MEDIA: (bounded multi-decode)",
+        ),
+        (
+            "MEDIA:http://127.0.0.1:8080/api/media?path=/home/u/.ssh/id_rsa",
+            "loopback host reaching the authenticated media route",
+        ),
+        (
+            "MEDIA:http://localhost:8080/api/media?path=/etc/shadow",
+            "localhost by name",
+        ),
+        (
+            "MEDIA:http://192.168.1.5/api/media?path=/etc/shadow",
+            "RFC 1918 private host",
+        ),
+        (
+            "MEDIA:http://10.0.0.7/x.png",
+            "RFC 1918 10/8 host",
+        ),
+        (
+            "MEDIA:http://172.16.0.9/x.png",
+            "RFC 1918 172.16/12 host",
+        ),
+        (
+            "MEDIA:https://cdn.test/api/media?path=/etc/shadow",
+            "public host but our authenticated media route",
         ),
     ],
 )
-def test_external_url_with_nested_media_keyword_is_preserved_exactly(text, label):
-    """An exempt external token must survive byte-for-byte."""
+def test_external_url_hiding_a_local_target_is_placeholdered(text, label):
+    """The whole token is rejected when an http(s) URL smuggles a local target.
+
+    `is_external_media_url()` only sees the scheme, so these all used to be
+    preserved byte-for-byte into an anonymous snapshot. The share renderer
+    restores a preserved token into an image URL, so each of these either
+    round-trips a host path into the published share or makes the viewer's
+    browser issue a same-origin `/api/media` request.
+
+    The whole token must become the placeholder — never a partial rewrite, which
+    is what let the scanner resume inside a refused token.
+    """
     from api import shares
 
     out = shares._embed_share_media(text, allowed_roots=())
-    assert out == text, f"{label}: external token was rewritten"
-    assert shares._PLACEHOLDER not in out, (
-        f"{label}: a local-path placeholder was spliced into an external URL"
+    assert out == shares._PLACEHOLDER, (
+        f"{label}: expected the whole token to be placeholdered, got {out!r}"
     )
+    # No fragment of the smuggled local target may survive anywhere.
+    for leaked in ("etc/passwd", "etc/shadow", "id_rsa", "api/media"):
+        assert leaked not in out, f"{label}: {leaked!r} leaked into the share"
+
+
+def test_hidden_local_target_rejection_does_not_restart_mid_token():
+    """Rejecting a token must consume the WHOLE span, not resume inside it.
+
+    If the refusal left the scanner mid-token, the nested `MEDIA:/etc/shadow.png`
+    would match as a fresh LOCAL token and get its own placeholder — producing
+    two placeholders and proving the scan restarted inside a refused span.
+    """
+    from api import shares
+
+    text = "before MEDIA:https://cdn.test/i.png?src=MEDIA:/etc/shadow.png after"
+    out = shares._embed_share_media(text, allowed_roots=())
+    assert out.count(shares._PLACEHOLDER) == 1, (
+        f"expected exactly one placeholder for one token, got {out!r}"
+    )
+    assert out == f"before {shares._PLACEHOLDER} after"
 
 
 def test_local_path_inside_allowed_root_still_embeds(tmp_path):

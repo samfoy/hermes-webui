@@ -1289,10 +1289,119 @@ def is_external_media_url(ref: str) -> bool:
     replacing it with a placeholder. Same for ``data:`` — the share boundary
     handles those on their own terms.
 
+    This answers ONLY "does this token carry an http(s) scheme". It is not a
+    trust decision: an http(s) URL can still smuggle a local target in its
+    path, query, or fragment. A caller publishing to an untrusted audience must
+    additionally consult :func:`external_media_url_hides_local_target`.
+
     Mirrors ``_isExternalMediaUrl()`` in static/ui.js.
     """
     value = unquote_media_ref(ref)
     return bool(_re.match(r"(?i)^https?://", value))
+
+
+# Loopback and RFC 1918 / RFC 4193 private hosts. A share snapshot is rendered
+# by an anonymous browser, so a URL naming one of these resolves in the
+# VIEWER's network position, not ours — and for a viewer running Hermes
+# locally that is the authenticated origin itself.
+_PRIVATE_HOST_RE = _re.compile(
+    r"""(?ix) ^ (?:
+          localhost
+        | (?:127|10) \. \d{1,3} \. \d{1,3} \. \d{1,3}
+        | 192 \. 168 \. \d{1,3} \. \d{1,3}
+        | 172 \. (?:1[6-9]|2\d|3[01]) \. \d{1,3} \. \d{1,3}
+        | 169 \. 254 \. \d{1,3} \. \d{1,3}
+        | 0 \. 0 \. 0 \. 0
+        | \[? (?: ::1 | [fF][cCdD][0-9a-fA-F]{2} : .* | [fF][eE][89abAB][0-9a-fA-F] : .* ) \]?
+      ) $
+    """
+)
+
+# Substrings that mean "this URL leads back to a local or authenticated
+# target" once they appear in an http(s) URL's path, query, or fragment.
+_LOCAL_TARGET_MARKERS = (
+    "media:",       # a nested MEDIA: token the share renderer would restore
+    "file://",      # an absolute host path
+    "/api/media",   # our own authenticated media route
+)
+
+
+def _decode_url_component_bounded(value: str, *, rounds: int = 3) -> str:
+    """Percent-decode ``value`` up to ``rounds`` times, stopping when stable.
+
+    Bounded on purpose: a single decode misses ``%254d`` (``%4d`` after one
+    pass, ``M`` after two), and an unbounded loop is a DoS on crafted input.
+    Three passes covers realistic nesting with a fixed ceiling.
+    """
+    from urllib.parse import unquote as _unquote
+
+    current = str(value or "")
+    for _ in range(max(0, rounds)):
+        nxt = _unquote(current)
+        if nxt == current:
+            break
+        current = nxt
+    return current
+
+
+def external_media_url_hides_local_target(ref: str) -> bool:
+    """True when an http(s) MEDIA ref smuggles a LOCAL or AUTHENTICATED target.
+
+    :func:`is_external_media_url` looks only at the scheme, so it says "leave
+    this token alone" for a URL whose own path/query/fragment names a local
+    file or our authenticated media route. In a PUBLIC share that is a privacy
+    hole rather than a cosmetic one: the share renderer restores the preserved
+    token into an image URL, and shapes such as
+
+        MEDIA:https://cdn.test/i.png?src=MEDIA:/etc/shadow.png
+        MEDIA:http://127.0.0.1:8080/api/media?path=/home/u/.ssh/id_rsa
+
+    then either round-trip a host path into the published snapshot or issue a
+    same-origin ``/api/media`` request from the viewer's browser.
+
+    Reported when EITHER holds:
+
+    * the host is loopback/link-local/RFC 1918 — an anonymous viewer resolves
+      it in their own network position, so it is never a public asset; or
+    * the normalized path, query, or fragment contains a local-target marker
+      (a nested ``MEDIA:``, ``file://``, or our ``/api/media`` route).
+
+    The netloc is deliberately excluded from marker matching so an ordinary
+    public CDN host is never rejected for its name alone. Harmless public query
+    strings (``?w=800&fmt=webp``) contain no marker and are preserved exactly.
+
+    Callers treat a True result as "reject the WHOLE token", never as "rewrite
+    part of it" — a partial rewrite is what let the scanner resume inside a
+    refused token in the first place.
+
+    Mirrors ``_externalMediaUrlHidesLocalTarget()`` in static/ui.js.
+    """
+    from urllib.parse import urlsplit
+
+    value = unquote_media_ref(ref)
+    if not _re.match(r"(?i)^https?://", value):
+        return False
+    try:
+        parts = urlsplit(value)
+    except ValueError:
+        # Unparseable as a URL — fail CLOSED. A share must not preserve a token
+        # whose shape we cannot reason about.
+        return True
+
+    host = (parts.hostname or "").strip()
+    if host and _PRIVATE_HOST_RE.match(host):
+        return True
+    # An empty host on an http(s) URL is malformed (`http:///x`); fail closed.
+    if not host:
+        return True
+
+    # Only the parts a renderer can turn into a nested target. netloc excluded
+    # so a public host name is never a marker hit.
+    probe = "".join((parts.path or "", "?" + parts.query if parts.query else "",
+                     "#" + parts.fragment if parts.fragment else ""))
+    probe_decoded = _decode_url_component_bounded(probe).lower()
+    return any(marker in probe_decoded for marker in _LOCAL_TARGET_MARKERS)
+
 
 
 def media_token_pattern(extra_exclude: str = "", exclude_urls: bool = False) -> str:

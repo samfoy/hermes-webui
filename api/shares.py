@@ -29,6 +29,7 @@ from api.helpers import (
     media_token_pattern,
     unquote_media_ref,
     is_external_media_url,
+    external_media_url_hides_local_target,
 )
 # _redact_fn_cached is the ALWAYS-ON credential redactor (agent redactor with
 # force=True + local fallback regex). Unlike redact_session_data it does NOT
@@ -317,7 +318,19 @@ def _embed_share_media(text: str, *, allowed_roots: tuple[Path, ...] = ()) -> st
         # inside a refused token and rewrite the tail of an external URL that
         # itself contains `MEDIA:`. Return the exact original span so an exempt
         # external token is preserved byte-for-byte.
+        #
+        # But "carries an http(s) scheme" is NOT the same as "safe to publish".
+        # The share renderer restores a preserved token into an image URL, so a
+        # URL whose own path/query/fragment names a local file, our
+        # authenticated /api/media route, or a loopback/private host would
+        # either round-trip a host path into the anonymous snapshot or make the
+        # viewer's browser issue a same-origin authenticated request. Decide the
+        # WHOLE token: preserve it byte-for-byte, or placeholder all of it. A
+        # partial rewrite is exactly the bug that let the scanner resume inside
+        # a token it had refused.
         if is_external_media_url(raw):
+            if external_media_url_hides_local_target(raw):
+                return _PLACEHOLDER
             return m.group(0)
 
         # --- Resolve and validate against allowed roots -----------------------

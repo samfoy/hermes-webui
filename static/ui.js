@@ -2689,6 +2689,76 @@ function _unquoteMediaRef(ref){
   return (quote === '"' || quote === "'") && value.endsWith(quote) ? value.slice(1, -1) : value;
 }
 
+/** True when a MEDIA ref carries an http(s) scheme. Scheme only — NOT a trust
+ *  decision. Mirrors is_external_media_url() in api/helpers.py. */
+function _isExternalMediaUrl(ref){
+  return /^https?:\/\//i.test(_unquoteMediaRef(ref));
+}
+
+/** Markers meaning "this URL leads back to a local or authenticated target".
+ *  Built lazily inside a function rather than held in a module-scope `const`:
+ *  several test harnesses extract these helpers by name and eval them before
+ *  the module body has finished evaluating, and a `const` read in that window
+ *  throws a temporal-dead-zone ReferenceError instead of returning a verdict.
+ *  A security predicate must never fail that way.
+ *  Mirrors _LOCAL_TARGET_MARKERS in api/helpers.py. */
+function _localTargetMarkers(){
+  return ['media:', 'file://', '/api/media'];
+}
+
+/** Percent-decode up to `rounds` times, stopping when stable. Bounded: a single
+ *  decode misses `%254d`, and an unbounded loop is a DoS on crafted input.
+ *  Mirrors _decode_url_component_bounded() in api/helpers.py. */
+function _decodeUrlComponentBounded(value, rounds){
+  let current = String(value || '');
+  const max = typeof rounds === 'number' ? rounds : 3;
+  for(let i=0; i<max; i++){
+    let next;
+    try{ next = decodeURIComponent(current); }
+    catch(_){ return current; }
+    if(next === current) break;
+    current = next;
+  }
+  return current;
+}
+
+/** True when an http(s) MEDIA ref smuggles a LOCAL or AUTHENTICATED target.
+ *
+ *  Defense in depth for the share page. api/shares.py already placeholders
+ *  these server-side before a snapshot is written, but this renderer also runs
+ *  on the PUBLIC share page (static/share.html loads ui.js; share.js calls
+ *  renderMd()), and the https:// branch of _inlineMediaHtmlForRef() rewrites a
+ *  loopback host to document.baseURI — which on a share origin turns
+ *  `MEDIA:http://127.0.0.1:8080/api/media?path=...` into a same-origin
+ *  authenticated request. Refuse to treat such a ref as a renderable image so
+ *  an older snapshot (written before the server-side guard) cannot fire it.
+ *
+ *  Scope note: a private/loopback HOST alone is NOT reported here. In the
+ *  normal app a loopback asset URL is legitimate and must keep following the
+ *  origin, and `_inlineMediaHtmlForRef` calls this before its rewrite. Only a
+ *  smuggled local TARGET (nested `MEDIA:`, `file://`, or our `/api/media`
+ *  route) makes a ref unrenderable. The server-side twin in api/helpers.py is
+ *  stricter — it also rejects private hosts outright — because a snapshot is
+ *  published to an anonymous audience where a loopback URL can never be a
+ *  valid public asset. Deliberate asymmetry, not drift.
+ *
+ *  Mirrors the marker half of external_media_url_hides_local_target()
+ *  in api/helpers.py. */
+function _externalMediaUrlHidesLocalTarget(ref){
+  const value = _unquoteMediaRef(ref);
+  if(!/^https?:\/\//i.test(value)) return false;
+  let u;
+  try{ u = new URL(value); }
+  catch(_){ return true; }  // unparseable → fail closed
+  const host = (u.hostname || '').trim();
+  if(!host) return true;
+  // Only the parts a renderer can turn into a nested target; hostname excluded
+  // so an ordinary public CDN host is never rejected for its name alone.
+  const probe = (u.pathname || '') + (u.search || '') + (u.hash || '');
+  const decoded = _decodeUrlComponentBounded(probe).toLowerCase();
+  return _localTargetMarkers().some(marker => decoded.indexOf(marker) !== -1);
+}
+
 // Markdown image syntax ![alt](url) → HTML. https:// keeps the historical direct
 // <img>; file:// and bare data:image/ URIs route through the same helpers the
 // MEDIA: pipeline uses, so ![x](file:///p.png) renders the artifact card instead
@@ -2730,8 +2800,30 @@ function _inlineMediaHtmlForRef(ref, sessionId, altText){
   if(/^https?:\/\//i.test(ref)){
     let src=ref;
     if(/^https?:\/\/(localhost|127\.0\.0\.1)(:\d+)?/i.test(src)){
+      // Retarget a loopback ref at the CURRENT origin. This is deliberate for
+      // the normal app (a dev-server asset URL should follow the app), but it is
+      // exactly what makes a hostile ref dangerous on the PUBLIC share page:
+      // `MEDIA:http://127.0.0.1:8080/api/media?path=/etc/shadow` would become a
+      // same-origin AUTHENTICATED request issued by the viewer's browser.
+      //
+      // So gate only the rewrite, not loopback rendering as a whole: if the ref
+      // hides a nested MEDIA:/file:///api/media target, render it inert. A plain
+      // loopback image (`http://127.0.0.1:8787/img/shot.png`) is untouched and
+      // still follows the origin as before.
+      //
+      // api/shares.py placeholders these server-side before a snapshot is ever
+      // written; this is the second line, so a snapshot written by an older
+      // build cannot fire one either.
+      if(typeof _externalMediaUrlHidesLocalTarget==='function' && _externalMediaUrlHidesLocalTarget(ref)){
+        return `<code>${esc(String(ref).slice(0,120))}</code>`;
+      }
       const base=(typeof document!=='undefined'&&document.baseURI||'').replace(/\/$/,'');
       src=src.replace(/^https?:\/\/(localhost|127\.0\.0\.1)(:\d+)?/i,base);
+    }else if(typeof _externalMediaUrlHidesLocalTarget==='function' && _externalMediaUrlHidesLocalTarget(ref)){
+      // Non-loopback host, but the URL still smuggles a local/authenticated
+      // target in its path, query, or fragment (`https://cdn.test/api/media?...`,
+      // or a nested `MEDIA:`/`file://`). Never a renderable public asset.
+      return `<code>${esc(String(ref).slice(0,120))}</code>`;
     }
     const urlPath=src.split('?')[0];
     // SVG URLs → render inline as image (must precede the https:// <img>
