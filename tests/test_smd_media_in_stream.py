@@ -67,6 +67,10 @@ def _run_tail_flush_partition_cases() -> dict:
             _extract_js_function(UI_JS, "_mediaPathSrc"),
             _extract_js_function(UI_JS, "_mediaTokenRe"),
             _extract_js_function(UI_JS, "_unquoteMediaRef"),
+            # Shared lexical ceiling: extracted, never stubbed, so these
+            # harnesses exercise the same length rule as production.
+            _extract_js_function(UI_JS, "_mediaTokenMaxLength"),
+            _extract_js_function(UI_JS, "_mediaTokenExceedsMaxLength"),
             _extract_js_function(MESSAGES_JS, "_smdMediaWriteText"),
             _extract_js_function(MESSAGES_JS, "_smdMediaTailEntryChunk"),
             _extract_js_function(MESSAGES_JS, "_smdMediaTailFlushEntry"),
@@ -117,6 +121,10 @@ def _run_real_smd_media_cases() -> dict:
             _extract_js_function(UI_JS, "_mediaPathSrc"),
             _extract_js_function(UI_JS, "_mediaTokenRe"),
             _extract_js_function(UI_JS, "_unquoteMediaRef"),
+            # Shared lexical ceiling: extracted, never stubbed, so these
+            # harnesses exercise the same length rule as production.
+            _extract_js_function(UI_JS, "_mediaTokenMaxLength"),
+            _extract_js_function(UI_JS, "_mediaTokenExceedsMaxLength"),
             _extract_js_function(MESSAGES_JS, "_smdMediaPrefixTail"),
             _extract_js_function(MESSAGES_JS, "_smdAppendPlainText"),
             _extract_js_function(MESSAGES_JS, "_smdMediaWriteText"),
@@ -371,19 +379,29 @@ class TestSmdMediaTailFlushPartition(unittest.TestCase):
         self.cases = _run_tail_flush_partition_cases()
 
     def test_malformed_open_quote_then_later_valid_token(self):
-        """An unterminated quoted ref must not swallow a later valid token."""
+        """An unterminated quoted ref stays PROSE; a later valid token still fires.
+
+        Previously the unterminated `MEDIA:"/tmp/bad.png` fell through to the
+        bare grammar, which captured the leading-quote fragment `"/tmp/bad.png`
+        and activated it as a media node — a value that reaches Path() with a
+        literal `"` in it, and that settled parsing never yields.
+
+        The shared grammar now excludes a quote from the FIRST character of every
+        unquoted alternative (ch_first / chFirst), so a quoted ref can only
+        activate media through the complete same-line quoted form. The malformed
+        span is preserved verbatim as literal text, and scanning continues so an
+        independent later token is unaffected.
+        """
         case = self.cases["malformedThenValid"]
         self.assertEqual(
-            case["media"], ['"/tmp/bad.png', "/tmp/good.png"],
-            "the later valid MEDIA token must still become a media node",
+            case["media"], ["/tmp/good.png"],
+            "only the later VALID token may become a media node; the "
+            "unterminated quoted ref must not activate",
         )
         self.assertEqual(
-            case["text"], " and ",
-            "only the exact prose between tokens may be written as text",
-        )
-        self.assertNotIn(
-            "MEDIA:", case["text"],
-            "no raw MEDIA: keyword may leak into the bubble as prose",
+            case["text"], 'MEDIA:"/tmp/bad.png and ',
+            "the malformed span is preserved verbatim as literal text, "
+            "including its MEDIA: keyword and leading quote",
         )
 
     def test_no_match_writes_candidate_verbatim(self):
@@ -440,12 +458,33 @@ class TestSmdMediaInStream(unittest.TestCase):
         # The whole point of the fix: the streaming path uses the SAME renderer
         # the renderMd pipeline uses. If messages.js constructed the HTML
         # inline, the live + settled images could diverge.
-        idx = MESSAGES_JS.index("function _smdMediaAwareAddText")
-        block = MESSAGES_JS[idx:idx + 6000]
+        #
+        # The delegation is INDIRECT and always has been:
+        #   _smdMediaAwareAddText -> _smdAppendMediaNode -> _inlineMediaHtmlForRef
+        # The previous spelling sliced a fixed 6000-character window after the
+        # wrapper and searched it for `_inlineMediaHtmlForRef`, which only ever
+        # passed because `_smdAppendMediaNode` happened to sit inside that
+        # window. That made the assertion sensitive to unrelated edits (adding
+        # comments to the wrapper broke it) while never actually pinning the
+        # chain. Assert each link by brace-accurate function extraction instead,
+        # so the test fails only if the delegation genuinely breaks.
+        wrapper = _extract_js_function(MESSAGES_JS, "_smdMediaAwareAddText")
         self.assertIn(
-            "_inlineMediaHtmlForRef", block,
-            "_smdMediaAwareAddText must call _inlineMediaHtmlForRef to keep "
+            "_smdAppendMediaNode", wrapper,
+            "_smdMediaAwareAddText must route MEDIA tokens through "
+            "_smdAppendMediaNode",
+        )
+        appender = _extract_js_function(MESSAGES_JS, "_smdAppendMediaNode")
+        self.assertIn(
+            "_inlineMediaHtmlForRef", appender,
+            "_smdAppendMediaNode must call _inlineMediaHtmlForRef to keep "
             "streaming and settled MEDIA paths byte-identical",
+        )
+        # And the wrapper must not hand-roll its own markup as a side channel.
+        self.assertNotIn(
+            "<img", wrapper,
+            "_smdMediaAwareAddText must not build media markup itself; all "
+            "media HTML comes from the shared renderer",
         )
 
     def test_safe_smd_renderer_wraps_add_text_with_media_interceptor(self):
@@ -564,8 +603,12 @@ class TestSmdMediaInStream(unittest.TestCase):
         # A split can happen inside the sentinel itself ("ME" + "DIA:foo.png"),
         # not only after the full "MEDIA:" prefix. Keep a rolling suffix scan
         # so the first half is buffered instead of rendered as visible prose.
-        idx = MESSAGES_JS.index("function _smdMediaAwareAddText")
-        block = MESSAGES_JS[idx:idx + 7000]
+        #
+        # Scoped by brace-accurate extraction rather than a fixed 7000-character
+        # window: the window silently slid past the tail-buffer block when
+        # comments were added to this function, so an unrelated edit failed here
+        # while the invariant was intact.
+        block = _extract_js_function(MESSAGES_JS, "_smdMediaAwareAddText")
         self.assertIn("const _SMD_MEDIA_PREFIX = 'MEDIA:'", MESSAGES_JS)
         self.assertIn("function _smdMediaPrefixTail", MESSAGES_JS)
         self.assertIn("_smdMediaPrefixTail(combined)", block)
@@ -631,6 +674,10 @@ class TestSmdMediaInStream(unittest.TestCase):
             _extract_js_function(UI_JS, "_mediaPathSrc"),
             _extract_js_function(UI_JS, "_mediaTokenRe"),
             _extract_js_function(UI_JS, "_unquoteMediaRef"),
+            # Shared lexical ceiling: extracted, never stubbed, so these
+            # harnesses exercise the same length rule as production.
+            _extract_js_function(UI_JS, "_mediaTokenMaxLength"),
+            _extract_js_function(UI_JS, "_mediaTokenExceedsMaxLength"),
             "const exts = JSON.parse(process.argv[1]);",
             "const out = {};",
             "for (const e of exts){",

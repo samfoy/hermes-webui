@@ -1404,6 +1404,38 @@ def external_media_url_hides_local_target(ref: str) -> bool:
 
 
 
+# ── MEDIA: token length ceiling (shared lexical contract) ────────────────────
+# The streaming JS parser buffers an unsettled MEDIA candidate in a per-parser
+# tail and caps that buffer. The cap is NOT a private implementation detail of
+# the streaming path: if streaming treats "buffer full" as "stream ended" and
+# finalizes the token, while settled `renderMd()` re-parses the same text with
+# no cap and sees ONE complete reference, the two renderings disagree — the
+# streamed view splits the ref into a media node plus stray prose.
+#
+# So the ceiling belongs to the GRAMMAR, in both languages: a MEDIA token may
+# not exceed MEDIA_TOKEN_MAX_LENGTH characters after the `MEDIA:` keyword. A
+# candidate that reaches the ceiling without a real delimiter is not a token at
+# all — it FAILS CLOSED and stays literal text until a genuine delimiter
+# arrives. That verdict is reachable identically from a streamed prefix and
+# from settled text, which is the property the streamed-vs-settled equality
+# tests pin.
+#
+# Kept in lockstep with `_MEDIA_TAIL_MAX` in static/messages.js and
+# `MEDIA_TOKEN_MAX_LENGTH` in static/ui.js.
+MEDIA_TOKEN_MAX_LENGTH = 4096
+
+
+def media_token_exceeds_max_length(ref: str) -> bool:
+    """True when a capture is too long to be a legal MEDIA token.
+
+    Measured on the RAW capture (quotes included), because the streaming buffer
+    is bounded by the raw characters it holds, not by the unquoted value.
+
+    Mirrors ``_mediaTokenExceedsMaxLength()`` in static/ui.js.
+    """
+    return len(str(ref or "")) > MEDIA_TOKEN_MAX_LENGTH
+
+
 def media_token_pattern(extra_exclude: str = "", exclude_urls: bool = False) -> str:
     """Return the MEDIA: path-capture pattern (one capture group).
 
@@ -1442,6 +1474,20 @@ def media_token_pattern(extra_exclude: str = "", exclude_urls: bool = False) -> 
     # One path character: no whitespace, and none of the delimiters that close
     # a token (plus any caller-specific exclusions).
     ch = r"[^\s)\]" + extra_exclude + r"]"
+    # FIRST character of an unquoted ref. A quote is excluded here — and only
+    # here — so an UNTERMINATED quoted ref cannot fall through to a bare branch.
+    #
+    # Without this, `MEDIA:"/tmp/bad.png` (no closing quote) fails the quoted
+    # alternative, falls through to the bare grammar, and captures the literal
+    # `"/tmp/bad.png` INCLUDING the leading quote. The streaming flush then
+    # activates that leading-quote fragment as a media node, and it reaches
+    # Path() with a `"` in it. A quoted ref may only activate media via the
+    # complete same-line quoted alternative above; anything else stays prose
+    # until a real delimiter, exactly as the settled parse yields.
+    #
+    # Interior quotes are still allowed (`ch` is unchanged), so a path that
+    # merely contains a quote keeps matching as it did.
+    ch_first = r"[^\s)\]\"'" + extra_exclude + r"]"
     # A whole space-separated word with NO dot in it. Requiring the intermediate
     # words to be dot-free is the bound: the run can cross `Reports/` and
     # `Notes/` but stops dead at the first word carrying a `.ext`, so trailing
@@ -1480,12 +1526,15 @@ def media_token_pattern(extra_exclude: str = "", exclude_urls: bool = False) -> 
     )
     spaced = (
         r"(?!(?:" + dotted_first_then_dotted_prose + r"))"
-        + r"(?!MEDIA:)" + ch + r"+?"
+        + r"(?!MEDIA:)" + ch_first + ch + r"*?"
         + r"(?:[^\S\n]" + word_no_dot + r")*?"
         + r"[^\S\n]" + final_with_ext
         + _MEDIA_TOKEN_BOUNDARY
     )
-    nospace = r"(?!MEDIA:)" + ch + r"+?\.[A-Za-z0-9]+" + _MEDIA_TOKEN_BOUNDARY
+    nospace = (
+        r"(?!MEDIA:)" + ch_first + ch + r"*?\.[A-Za-z0-9]+"
+        + _MEDIA_TOKEN_BOUNDARY
+    )
     # One path character that is NOT terminal sentence punctuation. This is a
     # TEMPERED GREEDY run, not a lazy one: it consumes as much as the old greedy
     # `ch+` did — so `C:/tmp/live.png` and a URL's own `://` and `MEDIA:`-bearing
@@ -1496,9 +1545,14 @@ def media_token_pattern(extra_exclude: str = "", exclude_urls: bool = False) -> 
     # so the lazy form stops at `C` in `C:/tmp/live.png`, and stops at the nested
     # `MEDIA:` inside an external URL.
     ch_not_sentence_end = r"(?:(?!" + _MEDIA_TOKEN_SENTENCE_END + r")" + ch + r")"
+    # Same run, but the FIRST character cannot be a quote (see ch_first): an
+    # unterminated quoted ref must not reach a bare branch.
+    ch_first_not_sentence_end = (
+        r"(?:(?!" + _MEDIA_TOKEN_SENTENCE_END + r")" + ch_first + r")"
+    )
     # Extension-less legacy shape: greedy over path characters, but a trailing
     # sentence `.`/`!`/`?` is left to the prose instead of being captured.
-    fallback = ch_not_sentence_end + r"+"
+    fallback = ch_first_not_sentence_end + ch_not_sentence_end + r"*"
     # A real HTTP(S) URL is one tempered-greedy run, tried BEFORE the bare forms
     # so `://host/...` (and any nested `MEDIA:` in its path/query) stays inside
     # one token. `MEDIA:https://h/a.png?q=1.` keeps the query and leaves the final
@@ -1515,7 +1569,9 @@ def media_token_pattern(extra_exclude: str = "", exclude_urls: bool = False) -> 
         + r"|" + fallback
         # Last resort: a token that reaches neither an extension nor a boundary
         # (e.g. the final bytes of a still-streaming ref) keeps the historic
-        # greedy behavior so nothing that resolved before stops resolving.
-        + r"|" + ch + r"+"
+        # greedy behavior so nothing that resolved before stops resolving. The
+        # leading-quote exclusion still applies, so an unterminated quoted ref
+        # cannot land here either.
+        + r"|" + ch_first + ch + r"*"
         + r")"
     )

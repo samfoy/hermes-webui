@@ -2607,6 +2607,14 @@ function _mediaPathSrc(){
   // One path character: no whitespace, and none of the delimiters that close a
   // token.
   const ch = String.raw`[^\s\)\]]`;
+  // FIRST character of an unquoted ref. A quote is excluded here — and only
+  // here — so an UNTERMINATED quoted ref cannot fall through to a bare branch.
+  // Without it, `MEDIA:"/tmp/bad.png` (no closing quote) fails the quoted
+  // alternative, falls through to the bare grammar, and captures the literal
+  // `"/tmp/bad.png` INCLUDING the leading quote, which the streaming flush then
+  // activates as a media node. Interior quotes stay legal (`ch` is unchanged).
+  // Kept in lockstep with ch_first in api/helpers.py.
+  const chFirst = String.raw`[^\s\)\]"']`;
   // A whole space-separated word that contains NO dot. Requiring the
   // intermediate words to be dot-free is what BOUNDS the spaced form: the run
   // can cross `Reports/` or `Notes/`, but stops dead at the first word carrying
@@ -2648,6 +2656,8 @@ function _mediaPathSrc(){
   // stay inside one token. A lazy `${ch}+?` would stop at `C` (because `:`
   // closes a token) and at a nested `MEDIA:`.
   const chNotSentenceEnd = String.raw`(?:(?!${sentenceEnd})${ch})`;
+  // Same run, first character only — cannot be a quote (see chFirst).
+  const chFirstNotSentenceEnd = String.raw`(?:(?!${sentenceEnd})${chFirst})`;
   // Ambiguous prose shape: the FIRST word is already a complete dot-bearing
   // filename, followed by dot-free prose and then another filename:
   //
@@ -2661,19 +2671,19 @@ function _mediaPathSrc(){
   const wordNoDotNoSlash = String.raw`(?!MEDIA:)[^\s\)\]\./]+`;
   const finalWithExtNoSlash = String.raw`(?!MEDIA:)${noSlash}+?\.[A-Za-z0-9]+`;
   const dottedFirstThenDottedProse = String.raw`(?!MEDIA:)${ch}+?\.[A-Za-z0-9]+(?:[^\S\n]${wordNoDotNoSlash})*?[^\S\n]${finalWithExtNoSlash}${boundary}`;
-  const spaced = String.raw`(?!(?:${dottedFirstThenDottedProse}))(?!MEDIA:)${ch}+?(?:[^\S\n]${wordNoDot})*?[^\S\n]${finalWithExt}${boundary}`;
-  const nospace = String.raw`(?!MEDIA:)${ch}+?\.[A-Za-z0-9]+${boundaryOrSentence}`;
+  const spaced = String.raw`(?!(?:${dottedFirstThenDottedProse}))(?!MEDIA:)${chFirst}${ch}*?(?:[^\S\n]${wordNoDot})*?[^\S\n]${finalWithExt}${boundary}`;
+  const nospace = String.raw`(?!MEDIA:)${chFirst}${ch}*?\.[A-Za-z0-9]+${boundaryOrSentence}`;
   // A real HTTP(S) URL is one tempered-greedy run, tried BEFORE the bare forms so
   // `://host/...` (and a nested `MEDIA:` in its path/query) stays in one token. A
   // query string keeps its `?`/`!`; a trailing period stays in the sentence.
   const externalUrl = String.raw`(?:[hH][tT][tT][pP][sS]?)://${chNotSentenceEnd}+`;
   // Extension-less legacy shape: greedy over path characters, but a trailing
   // sentence `.`/`!`/`?` is left to the prose instead of captured.
-  const extensionless = String.raw`${chNotSentenceEnd}+`;
+  const extensionless = String.raw`${chFirstNotSentenceEnd}${chNotSentenceEnd}*`;
   // Quoted form wins first (can hold any character), then the spaced form, then
   // the no-space form, then the fallback for extension-less paths.
   // Kept in lockstep with media_token_pattern() in api/helpers.py.
-  return String.raw`"[^"\n]+"|'[^'\n]+'|${externalUrl}|${spaced}|${nospace}|${extensionless}|${ch}+`;
+  return String.raw`"[^"\n]+"|'[^'\n]+'|${externalUrl}|${spaced}|${nospace}|${extensionless}|${chFirst}${ch}*`;
 }
 
 /** Global matcher for MEDIA: tokens. Fresh instance per call — a shared /g regex
@@ -2693,6 +2703,25 @@ function _unquoteMediaRef(ref){
  *  decision. Mirrors is_external_media_url() in api/helpers.py. */
 function _isExternalMediaUrl(ref){
   return /^https?:\/\//i.test(_unquoteMediaRef(ref));
+}
+
+/** Ceiling on a MEDIA token's captured length — part of the shared lexical
+ *  contract, NOT a private detail of the streaming buffer. If the streaming
+ *  parser treated "buffer full" as "stream ended" and finalized the token while
+ *  settled renderMd() re-parsed the same text uncapped and saw ONE complete
+ *  reference, the two renderings would disagree. A candidate that reaches the
+ *  ceiling without a real delimiter is not a token: it fails closed and stays
+ *  literal text.
+ *
+ *  Kept in lockstep with MEDIA_TOKEN_MAX_LENGTH in api/helpers.py and
+ *  _MEDIA_TAIL_MAX in static/messages.js. */
+function _mediaTokenMaxLength(){ return 4096; }
+
+/** True when a capture is too long to be a legal MEDIA token. Measured on the
+ *  RAW capture (quotes included), matching the streaming buffer's own bound.
+ *  Mirrors media_token_exceeds_max_length() in api/helpers.py. */
+function _mediaTokenExceedsMaxLength(ref){
+  return String(ref == null ? '' : ref).length > _mediaTokenMaxLength();
 }
 
 /** Markers meaning "this URL leads back to a local or authenticated target".
@@ -7391,7 +7420,13 @@ function renderMd(raw){
   // generated images) and replace them with inline <img> or download links.
   // Stashed so the path/URL is never processed as markdown.
   const media_stash=[];
-  s=s.replace(_mediaTokenRe(),(_,raw_ref)=>{
+  s=s.replace(_mediaTokenRe(),(whole,raw_ref)=>{
+    // Honor the shared length ceiling here too. The streaming parser refuses an
+    // over-ceiling candidate (its buffer is bounded), so if settled parsing
+    // accepted one, a single reference would render as a card in one view and
+    // as literal text in the other. Leave the whole span untouched: it stays
+    // prose, exactly as the streamed path writes it.
+    if(_mediaTokenExceedsMaxLength(raw_ref)) return whole;
     media_stash.push(_unquoteMediaRef(raw_ref));
     return '\x00D'+(media_stash.length-1)+'\x00';
   });

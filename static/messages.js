@@ -4703,7 +4703,11 @@ function attachLiveStream(activeSid, streamId, uploaded=[], options={}){
       if(m.index>last){
         _smdMediaWriteText(entry.parent, entry.data, entry.baseAddText, entry.writeText, raw.slice(last,m.index));
       }
-      const emitted=!!(entry.parent && _smdAppendMediaNode(entry.parent, _unquoteMediaRef(m[1])));
+      // Same length ceiling as the live path and as settled renderMd(): an
+      // over-ceiling capture is not a legal token, so preserve its raw span as
+      // text instead of activating a card at stream end.
+      const emitted=!_mediaTokenExceedsMaxLength(m[1])
+        && !!(entry.parent && _smdAppendMediaNode(entry.parent, _unquoteMediaRef(m[1])));
       if(!emitted){
         _smdMediaWriteText(entry.parent, entry.data, entry.baseAddText, entry.writeText, m[0]);
       }
@@ -4792,27 +4796,73 @@ function attachLiveStream(activeSid, streamId, uploaded=[], options={}){
         || _smdMediaTailCouldExtend(trailing);
       if(mayGrow && !_smdMediaTokenIsSettled(m[1], false)){
         const candidate = combined.slice(m.index);
-        if(candidate.length < _MEDIA_TAIL_MAX){
+        // Buffer bound derived FROM the lexical ceiling, not an independent
+        // number. The ceiling is measured on the CAPTURE (everything after the
+        // keyword), so a candidate holding a still-legal ref is `MEDIA:` plus at
+        // most MEDIA_TOKEN_MAX_LENGTH characters. Bounding the candidate at the
+        // bare ceiling instead would refuse refs the settled parser accepts —
+        // a 4095-character capture is legal, but `MEDIA:` + 4095 is 4101 bytes.
+        const candidateMax = _mediaTokenMaxLength() + _SMD_MEDIA_PREFIX.length;
+        if(candidate.length <= candidateMax){
           unmatchedTail = candidate;
         } else {
-          // The candidate exceeded the bounded tail. Do NOT flatten it to plain
-          // text: it can already contain a complete token plus same-line prose
-          // that merely looked extendable (`MEDIA:/tmp/a.png see ... README.md`).
-          // Reuse the stream-end partitioner, which applies the current shared
-          // grammar to every token and preserves every exact prose slice. This
-          // keeps an already-complete card while still bounding memory.
-          _smdMediaTailFlushEntry({
-            chunk:candidate,
-            parent,
-            data,
-            baseAddText,
-            writeText,
-          });
+          // Past the ceiling even allowing for the keyword. Two shapes reach
+          // here and they need opposite treatment — collapsing them is what the
+          // re-gate caught.
+          //
+          // (a) A COMPLETE, legal token followed by a long same-line prose run
+          //     that merely looked extendable (`MEDIA:/tmp/a.png see ...4000`).
+          //     Settled parsing renders its card, so flattening the whole
+          //     candidate to text would silently drop a card. Partition: emit
+          //     the token, write the exact prose slices.
+          //
+          // (b) The REFERENCE ITSELF exceeds the ceiling. EOF-style
+          //     partitioning would cut it at the cap, emit the prefix as a media
+          //     node, and leave the rest as prose, while settled renderMd()
+          //     applies the same ceiling and keeps the whole span as text. So
+          //     FAIL CLOSED and write it literally.
+          //
+          // Ask the shared grammar which shape this is, and judge the CAPTURE
+          // against the ceiling — the same measurement api/helpers.py uses.
+          const probe = _mediaTokenRe();
+          const pm = probe.exec(candidate);
+          if(pm && !_mediaTokenExceedsMaxLength(pm[1])){
+            _smdMediaTailFlushEntry({
+              chunk:candidate,
+              parent,
+              data,
+              baseAddText,
+              writeText,
+            });
+          } else if(pm){
+            // Case (b): the ref itself is over the ceiling. Write JUST that
+            // ref's span as literal text, then resume the outer scan after it
+            // instead of flattening the whole remainder. A later INDEPENDENT
+            // token (`...oversized... then MEDIA:/tmp/ok.png`) is still a legal
+            // reference and settled parsing renders its card, so swallowing the
+            // rest of the line here would drop it.
+            const refEnd = m.index + pm.index + pm[0].length;
+            writeCurrent(combined.slice(m.index, refEnd));
+            last = refEnd;
+            re.lastIndex = refEnd;
+            continue;
+          } else {
+            writeCurrent(candidate);
+          }
         }
         last = combined.length;
         break;
       }
-      if(!_smdAppendMediaNode(parent, _unquoteMediaRef(m[1]))) writeCurrent(m[0]);
+      // Length ceiling applies at the ACTIVATION point too, not only in the
+      // buffer branch above. A token followed by a delimiter is "settled" and
+      // never enters the tail buffer, so without this an over-ceiling ref would
+      // become a media node here while settled renderMd() (which applies the
+      // same ceiling) keeps it as prose.
+      if(_mediaTokenExceedsMaxLength(m[1])){
+        writeCurrent(m[0]);
+      } else if(!_smdAppendMediaNode(parent, _unquoteMediaRef(m[1]))) {
+        writeCurrent(m[0]);
+      }
       last = matchEnd;
     }
     // Tail buffer — hold trailing bytes that look like an unterminated

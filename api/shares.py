@@ -30,6 +30,7 @@ from api.helpers import (
     unquote_media_ref,
     is_external_media_url,
     external_media_url_hides_local_target,
+    media_token_exceeds_max_length,
 )
 # _redact_fn_cached is the ALWAYS-ON credential redactor (agent redactor with
 # force=True + local fallback regex). Unlike redact_session_data it does NOT
@@ -311,6 +312,13 @@ def _embed_share_media(text: str, *, allowed_roots: tuple[Path, ...] = ()) -> st
         # path that the renderer displays would be placeholdered here.
         raw = unquote_media_ref(m.group(1) or "")
         if not raw:
+            return m.group(0)
+        # An over-ceiling capture is not a legal MEDIA token (shared lexical
+        # contract; see MEDIA_TOKEN_MAX_LENGTH in api/helpers.py). Neither
+        # renderer turns it into a media node, so the snapshot must leave the
+        # span exactly as prose rather than embed or placeholder it — otherwise
+        # the share and the live view disagree about one token.
+        if media_token_exceeds_max_length(m.group(1) or ""):
             return m.group(0)
         # Classification happens HERE, on a token that was actually matched, and
         # is the only thing that decides external vs local. The pattern no longer

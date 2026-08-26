@@ -39,7 +39,16 @@ MESSAGES_JS = (REPO_ROOT / "static" / "messages.js").read_text(encoding="utf-8")
 
 # Every function in the real _smdMediaAwareAddText call chain. Extracted, never
 # retyped. Order matters only for readability — JS function decls hoist.
-_UI_FUNCS = ["_mediaPathSrc", "_mediaTokenRe", "_unquoteMediaRef"]
+_UI_FUNCS = [
+    "_mediaPathSrc",
+    "_mediaTokenRe",
+    "_unquoteMediaRef",
+    # Part of the shared lexical contract the streaming path consults when a
+    # candidate reaches the tail cap. Must be the REAL function, not a stub, or
+    # the harness would not exercise the ceiling it is meant to pin.
+    "_mediaTokenMaxLength",
+    "_mediaTokenExceedsMaxLength",
+]
 _MSG_FUNCS = [
     "_smdMediaPrefixTail",
     "_smdMediaTailEntryChunk",
@@ -96,6 +105,40 @@ LONG_AFTER_CASES = [
     "MEDIA:/tmp/a.png see " + ("w" * (_TAIL_MAX + 32)) + " README.md",
 ]
 
+# The REFERENCE ITSELF crosses the ceiling — the case the re-gate called out as
+# missing. LONG_AFTER_CASES above covers a SHORT complete ref followed by long
+# prose; these cover a single ref whose own length lands exactly on 4095 / 4096 /
+# 4097 characters, with no delimiter to settle it early.
+#
+# This is the boundary that decides whether the cap behaves as a lexical rule or
+# as a fake stream end. Under the old code the streaming path ran EOF-style
+# partitioning at the cap, emitting the ref's prefix as a media node and the
+# remainder as prose, while settled parsing saw one complete reference. Both
+# sides now apply the same ceiling: at or below it the ref is a token, above it
+# the whole span stays literal text.
+#
+# Length is measured on the CAPTURE (everything after `MEDIA:`), matching
+# media_token_exceeds_max_length() / _mediaTokenExceedsMaxLength().
+def _ref_of_capture_length(n: int) -> str:
+    """A `MEDIA:` token whose capture is exactly ``n`` characters."""
+    suffix = ".png"
+    prefix = "/tmp/"
+    filler = n - len(prefix) - len(suffix)
+    assert filler > 0, n
+    return "MEDIA:" + prefix + ("y" * filler) + suffix
+
+
+OVERSIZED_REF_CASES = [
+    # Exactly at the ceiling — still a legal token on both sides.
+    _ref_of_capture_length(_TAIL_MAX - 1),
+    _ref_of_capture_length(_TAIL_MAX),
+    # One past the ceiling — literal text on both sides.
+    _ref_of_capture_length(_TAIL_MAX + 1),
+    # And with trailing prose after the oversized ref, so the "keep scanning"
+    # path is exercised too.
+    _ref_of_capture_length(_TAIL_MAX + 1) + " then MEDIA:/tmp/ok.png",
+]
+
 
 def _extract_js_function(src: str, name: str) -> str:
     start = src.index(f"function {name}(")
@@ -131,6 +174,11 @@ function settledEvents(text){
   const out = [];
   let m, last = 0;
   while ((m = re.exec(text))){
+    // Mirror renderMd()'s MEDIA stash: an over-ceiling capture is not a legal
+    // token, so the whole span stays prose. Without this the oracle would model
+    // a contract the real settled renderer no longer implements, and it would
+    // demand that streaming split an oversized ref.
+    if (_mediaTokenExceedsMaxLength(m[1])) continue;
     if (m.index > last) out.push({kind:'TEXT', v:text.slice(last, m.index)});
     out.push({kind:'MEDIA', v:_unquoteMediaRef(m[1])});
     last = m.index + m[0].length;
@@ -217,6 +265,11 @@ def long_after_result():
     return _run(LONG_AFTER_CASES, two_cuts=False)
 
 
+@pytest.fixture(scope="module")
+def oversized_ref_result():
+    return _run(OVERSIZED_REF_CASES, two_cuts=False)
+
+
 def test_stream_and_settled_agree_over_every_chunk_cut(short_result):
     assert short_result["checks"] > 5000, (
         f"sweep too small: {short_result['checks']} splits"
@@ -258,15 +311,110 @@ def test_long_dotted_prose_after_a_complete_ref_does_not_lose_card(long_after_re
     )
 
 
+def test_oversized_reference_itself_agrees_across_the_ceiling(oversized_ref_result):
+    """A ref whose OWN length crosses 4095/4096/4097 renders the same both ways.
+
+    The re-gate's blocker: ``_smdMediaTailFlushEntry`` applied final/EOF
+    partitioning the moment a candidate reached ``_MEDIA_TAIL_MAX``, even though
+    the stream had not ended. When the reference itself crossed the cap, the
+    prefix became a media node and the tail became prose, while settled
+    ``renderMd()`` re-parsed the same text uncapped and saw ONE complete
+    reference — a single token rendering two different ways.
+
+    The cap is now a shared lexical rule (``MEDIA_TOKEN_MAX_LENGTH`` in
+    api/helpers.py, ``_mediaTokenMaxLength()`` in static/ui.js) that both the
+    streaming path and the settled stash apply, so the verdict is identical
+    regardless of where the chunk boundary falls.
+    """
+    assert oversized_ref_result["checks"] > _TAIL_MAX, (
+        f"oversized-ref sweep too small: {oversized_ref_result['checks']}"
+    )
+    assert oversized_ref_result["total"] == 0, (
+        "a reference crossing the length ceiling rendered differently streamed "
+        f"vs settled; {oversized_ref_result['total']} mismatches, first few: "
+        f"{oversized_ref_result['failures']}"
+    )
+
+
+def test_oversized_ref_fixtures_actually_straddle_the_ceiling():
+    """Non-vacuity: the fixtures must land on both sides of the boundary.
+
+    Without this, a future edit to ``_ref_of_capture_length`` (or to the ceiling)
+    could leave every OVERSIZED_REF_CASES row on the legal side, and the sweep
+    above would stay green while proving nothing about the boundary.
+    """
+    import re as _re
+
+    from api.helpers import (
+        MEDIA_TOKEN_MAX_LENGTH,
+        media_token_exceeds_max_length,
+        media_token_pattern,
+    )
+
+    assert MEDIA_TOKEN_MAX_LENGTH == _TAIL_MAX, (
+        "the Python ceiling and the JS tail cap must be the same number"
+    )
+
+    rx = _re.compile(media_token_pattern())
+    verdicts = []
+    for case in OVERSIZED_REF_CASES:
+        m = rx.search(case)
+        assert m, f"fixture did not match the grammar at all: {case[:40]}..."
+        verdicts.append(media_token_exceeds_max_length(m.group(1)))
+
+    assert any(v is False for v in verdicts), (
+        "no fixture is at/below the ceiling — the legal side is untested"
+    )
+    assert any(v is True for v in verdicts), (
+        "no fixture is above the ceiling — the rejection side is untested"
+    )
+    # And the exact boundary rows must be present: 4095/4096 legal, 4097 not.
+    assert media_token_exceeds_max_length("x" * (_TAIL_MAX - 1)) is False
+    assert media_token_exceeds_max_length("x" * _TAIL_MAX) is False
+    assert media_token_exceeds_max_length("x" * (_TAIL_MAX + 1)) is True
+
+
 def test_tail_cap_bounds_the_buffer_not_the_remaining_text():
-    """Pin the exact expression, so the gate cannot silently regress."""
-    idx = MESSAGES_JS.index("function _smdMediaAwareAddText")
-    block = MESSAGES_JS[idx:idx + 7000]
+    """Pin the exact expression, so the gate cannot silently regress.
+
+    Scoped by brace-accurate function extraction rather than a fixed character
+    window: a 7000-character slice silently drifts out of the function as soon as
+    anyone adds a comment, which turns an unrelated edit into a failure here (and,
+    worse, can slide the window PAST the expression so the assertion passes for
+    the wrong reason).
+    """
+    block = _extract_js_function(MESSAGES_JS, "_smdMediaAwareAddText")
     assert "tailValue.length < _MEDIA_TAIL_MAX" in block, (
         "the tail cap must bound tailValue (what is buffered), not rest.length"
     )
     assert "rest.length < _MEDIA_TAIL_MAX" not in block, (
         "gating on rest.length discards the buffered tail after long prose"
+    )
+
+
+def test_length_ceiling_is_enforced_at_every_activation_point():
+    """A ref may become a media node only if its capture is within the ceiling.
+
+    Three places can activate a card, and all three must consult the shared
+    ceiling or streamed and settled disagree:
+      * the live match loop in _smdMediaAwareAddText,
+      * the stream-end partitioner _smdMediaTailFlushEntry,
+      * the settled MEDIA stash in renderMd() (ui.js).
+    """
+    live = _extract_js_function(MESSAGES_JS, "_smdMediaAwareAddText")
+    assert "_mediaTokenExceedsMaxLength" in live, (
+        "the live path must apply the shared length ceiling before activating "
+        "a media node"
+    )
+    flush = _extract_js_function(MESSAGES_JS, "_smdMediaTailFlushEntry")
+    assert "_mediaTokenExceedsMaxLength" in flush, (
+        "the stream-end partitioner must apply the shared length ceiling too"
+    )
+    # renderMd() is huge; assert on the stash callback's immediate neighbourhood.
+    stash = UI_JS.index("const media_stash=[]")
+    window = UI_JS[stash:stash + 900]
+    assert "_mediaTokenExceedsMaxLength" in window, (
+        "settled renderMd() must apply the same ceiling as the streaming path"
     )
 
 

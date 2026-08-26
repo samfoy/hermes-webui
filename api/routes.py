@@ -2850,6 +2850,7 @@ from api.helpers import (
     _CLIENT_DISCONNECT_ERRORS,
     media_token_pattern,
     unquote_media_ref,
+    media_token_exceeds_max_length,
 )
 from api.agent_health import build_agent_health_payload
 from api.gateway_chat import gateway_chat_config_status
@@ -18854,6 +18855,13 @@ def _session_media_token_allows_path(sid: str, target: Path, allowed_mimes: set[
         if "MEDIA:" not in text:
             continue
         for ref in _MEDIA_TOKEN_RE.findall(text):
+            # An over-ceiling capture is not a legal MEDIA token (shared lexical
+            # contract; see MEDIA_TOKEN_MAX_LENGTH in api/helpers.py). Neither
+            # renderer will turn it into a media node, so it must not mint an
+            # allow-list entry either — otherwise a single oversized token could
+            # authorize a path that nothing on the page can actually request.
+            if media_token_exceeds_max_length(ref):
+                continue
             # A quoted ref (the unambiguous spelling for spaced paths) is
             # captured WITH its quotes so the matched span covers the whole
             # token; strip them before touching the filesystem, or the
