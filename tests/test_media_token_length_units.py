@@ -315,6 +315,12 @@ def consumer_verdicts() -> Any:
         "_smdMediaTokenIsSettled",
         "_smdMediaTailCouldExtend",
         "_smdMediaHasOpenQuote",
+        "_smdMediaOpenQuoteChar",
+        "_smdMediaRefuseLine",
+        "_smdMediaEntryRefused",
+        "_smdMediaRunChar",
+        "_smdMediaRefusedRunLength",
+        "_smdMediaCandidateMax",
         "_smdMediaTailFlushEntry",
         "_smdMediaTailFlush",
         "_smdMediaAwareAddText",
@@ -323,7 +329,6 @@ def consumer_verdicts() -> Any:
         [_extract_js_function(UI_JS, n) for n in ui]
         + [_extract_js_function(MESSAGES_JS, n) for n in msg]
         + [r"""
-const _MEDIA_TAIL_MAX = 4096;
 const _SMD_MEDIA_PREFIX = 'MEDIA:';
 const _SMD_MEDIA_TAIL = new Map();
 

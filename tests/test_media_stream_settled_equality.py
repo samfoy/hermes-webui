@@ -57,6 +57,15 @@ _MSG_FUNCS = [
     "_smdMediaTokenIsSettled",
     "_smdMediaTailCouldExtend",
     "_smdMediaHasOpenQuote",
+    # Refusal state for an over-limit reference: it must stay closed ACROSS a
+    # chunk boundary, so these are part of the real call chain too.
+    "_smdMediaOpenQuoteChar",
+    "_smdMediaRefuseLine",
+    "_smdMediaEntryRefused",
+    "_smdMediaRunChar",
+    "_smdMediaRefusedRunLength",
+    # The single candidate ceiling, replacing the old second _MEDIA_TAIL_MAX.
+    "_smdMediaCandidateMax",
     "_smdMediaTailFlushEntry",
     "_smdMediaTailFlush",
     "_smdMediaAwareAddText",   # the function under test
@@ -158,7 +167,6 @@ def _extract_js_function(src: str, name: str) -> str:
 # Only SINKS are stubbed. The parser-identity map and constants mirror production
 # values, which are asserted against the source below so they cannot drift.
 _HARNESS = r"""
-const _MEDIA_TAIL_MAX = 4096;
 const _SMD_MEDIA_PREFIX = 'MEDIA:';
 const _SMD_MEDIA_TAIL = new Map();
 
@@ -374,8 +382,20 @@ def test_oversized_ref_fixtures_actually_straddle_the_ceiling():
     assert media_token_exceeds_max_length("x" * (_TAIL_MAX + 1)) is True
 
 
-def test_tail_cap_bounds_the_buffer_not_the_remaining_text():
-    """Pin the exact expression, so the gate cannot silently regress.
+def test_one_inclusive_candidate_ceiling_bounds_every_buffering_branch():
+    """Pin the exact expressions, so the gate cannot silently regress.
+
+    Two invariants, and the second is the re-review blocker:
+
+    1. The cap bounds what is actually BUFFERED (``tailValue``), not the whole
+       remaining text. Gating on ``rest.length`` discards the buffered tail after
+       long prose, so the token never reassembles.
+    2. There is exactly ONE ceiling, ``_smdMediaCandidateMax()``, and every
+       branch applies it inclusively. The no-match / open-quote branch used a
+       separate, smaller ``_MEDIA_TAIL_MAX`` of 4096 while the matched-token
+       branch used 4102, so a legal quoted capture whose opening quote crossed a
+       chunk boundary was flushed as literal text at 4096 and lost its quote
+       ownership, while settled ``renderMd()`` accepted the same capture.
 
     Scoped by brace-accurate function extraction rather than a fixed character
     window: a 7000-character slice silently drifts out of the function as soon as
@@ -384,12 +404,31 @@ def test_tail_cap_bounds_the_buffer_not_the_remaining_text():
     the wrong reason).
     """
     block = _extract_js_function(MESSAGES_JS, "_smdMediaAwareAddText")
-    assert "tailValue.length < _MEDIA_TAIL_MAX" in block, (
-        "the tail cap must bound tailValue (what is buffered), not rest.length"
+    assert "tailValue.length <= _smdMediaCandidateMax()" in block, (
+        "the tail branch must bound tailValue (what is buffered) by the ONE "
+        "shared candidate ceiling, inclusively"
     )
     assert "rest.length < _MEDIA_TAIL_MAX" not in block, (
         "gating on rest.length discards the buffered tail after long prose"
     )
+    # No second ceiling anywhere in the module. Comments are stripped first: the
+    # explanatory comments legitimately NAME the removed constant, and scanning
+    # raw source would match those.
+    code = "\n".join(
+        line.split("//", 1)[0] for line in MESSAGES_JS.splitlines()
+    )
+    assert "_MEDIA_TAIL_MAX" not in code, (
+        "_MEDIA_TAIL_MAX was a SECOND ceiling that disagreed with "
+        "_mediaTokenMaxLength() + 'MEDIA:'.length for candidates from 4096 "
+        "through 4102 code units"
+    )
+    # And the one ceiling is derived from the shared capture ceiling, never a
+    # literal.
+    ceiling = _extract_js_function(MESSAGES_JS, "_smdMediaCandidateMax")
+    assert "_mediaTokenMaxLength()" in ceiling and "_SMD_MEDIA_PREFIX.length" in ceiling, (
+        "the candidate ceiling must be derived from the shared capture ceiling"
+    )
+    assert "4096" not in ceiling, "the ceiling must not restate the number"
 
 
 def test_length_ceiling_is_enforced_at_every_activation_point():

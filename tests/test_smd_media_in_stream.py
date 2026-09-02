@@ -73,6 +73,7 @@ def _run_tail_flush_partition_cases() -> dict:
             _extract_js_function(UI_JS, "_mediaTokenExceedsMaxLength"),
             _extract_js_function(MESSAGES_JS, "_smdMediaWriteText"),
             _extract_js_function(MESSAGES_JS, "_smdMediaTailEntryChunk"),
+            _extract_js_function(MESSAGES_JS, "_smdMediaCandidateMax"),
             _extract_js_function(MESSAGES_JS, "_smdMediaTailFlushEntry"),
         ]
     )
@@ -134,6 +135,12 @@ def _run_real_smd_media_cases() -> dict:
             _extract_js_function(MESSAGES_JS, "_smdMediaTokenIsSettled"),
             _extract_js_function(MESSAGES_JS, "_smdMediaTailCouldExtend"),
             _extract_js_function(MESSAGES_JS, "_smdMediaHasOpenQuote"),
+            _extract_js_function(MESSAGES_JS, "_smdMediaOpenQuoteChar"),
+            _extract_js_function(MESSAGES_JS, "_smdMediaRefuseLine"),
+            _extract_js_function(MESSAGES_JS, "_smdMediaEntryRefused"),
+            _extract_js_function(MESSAGES_JS, "_smdMediaRunChar"),
+            _extract_js_function(MESSAGES_JS, "_smdMediaRefusedRunLength"),
+            _extract_js_function(MESSAGES_JS, "_smdMediaCandidateMax"),
             _extract_js_function(MESSAGES_JS, "_smdMediaTailFlushEntry"),
             _extract_js_function(MESSAGES_JS, "_smdMediaTailFlush"),
             _extract_js_function(MESSAGES_JS, "_smdMediaAwareAddText"),
@@ -155,8 +162,7 @@ def _run_real_smd_media_cases() -> dict:
         "import * as smd from './static/vendor/smd.min.js';\n"
         "globalThis.window = { smd };\n"
         "globalThis.requestAnimationFrame = cb => cb();\n"
-        "const _MEDIA_TAIL_MAX = 4096;\n"
-        "const _SMD_MEDIA_PREFIX = 'MEDIA:';\n"
+                "const _SMD_MEDIA_PREFIX = 'MEDIA:';\n"
         "const _SMD_MEDIA_TAIL = new WeakMap();\n"
         "const __SMD_PARSER_FALLBACK = {};\n"
         "const _SMD_SAFE_URL_RE=/^(?:https?:|mailto:|tel:|message:|\\/|#|\\?|\\.|api|session\\/)/i;\n"
@@ -722,9 +728,17 @@ class TestSmdMediaInStream(unittest.TestCase):
     def test_tail_buffer_size_cap(self):
         # Defensive: a runaway tail buffer from a malformed stream could
         # exhaust memory. The implementation must enforce a max length on
-        # the per-parser tail.
-        self.assertIn("_MEDIA_TAIL_MAX", MESSAGES_JS,
+        # the per-parser tail. That limit is now the ONE shared candidate
+        # ceiling; the old separate _MEDIA_TAIL_MAX was a second ceiling that
+        # disagreed with it for candidates from 4096 through 4102 code units.
+        self.assertIn("_smdMediaCandidateMax()", MESSAGES_JS,
                       "Tail buffer must enforce a max length to bound memory")
+        # Comments stripped: they legitimately name the removed constant.
+        code = "\n".join(
+            line.split("//", 1)[0] for line in MESSAGES_JS.splitlines()
+        )
+        self.assertNotIn("_MEDIA_TAIL_MAX", code,
+                         "a second, disagreeing ceiling must not come back")
 
     def test_per_parser_tail_isolation(self):
         # Multiple smd parsers run concurrently in the worklog + anchor
