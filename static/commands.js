@@ -1903,17 +1903,38 @@ function cmdReasoning(args){
     return true;
   }
   if(EFFORTS.includes(arg)){
-    // Persist via /api/reasoning → config.yaml agent.reasoning_effort.
-    // Takes effect on the NEXT session/turn (agent re-reads config at
-    // construction time), matching CLI semantics where `/reasoning high`
-    // also forces an agent re-init.
-    api('/api/reasoning',{method:'POST',body:JSON.stringify({effort:arg})})
+    // Scope the write to the active session, exactly like the composer chip.
+    // Before this, /reasoning <effort> POSTed a bare {effort} and hit the
+    // profile-global default, so a session holding a persisted override kept
+    // its old effort while this toast claimed the new value applied.
+    // _reasoningEffortContext() adds session_id only when a session is active;
+    // with no session there is no override to scope to and the global write is
+    // the correct behaviour (it is what /reasoning does before the first chat).
+    const ctx=(typeof _reasoningEffortContext==='function')?_reasoningEffortContext():{};
+    const payload=Object.assign({effort:arg},ctx);
+    // Same stale-context guard as the chip POST: a request dispatched from
+    // session A can resolve after the user switches to session B, and applying
+    // it there would poison B's chip and cache. Snapshot the dispatch key and
+    // sequence number now, then discard a superseded response silently — no
+    // chip write, no toast.
+    const key=(typeof _reasoningEffortQuery==='function')?_reasoningEffortQuery():'';
+    const seq=(typeof _reasoningFetchSeq==='undefined')?null:++_reasoningFetchSeq;
+    const current=function(){
+      if(seq===null||typeof _reasoningDispatchIsCurrent!=='function') return true;
+      return _reasoningDispatchIsCurrent(seq,key);
+    };
+    // Takes effect on the NEXT turn (the agent re-reads its effort at
+    // construction time), matching CLI semantics where `/reasoning high` also
+    // forces an agent re-init.
+    api('/api/reasoning',{method:'POST',body:JSON.stringify(payload)})
       .then(function(st){
+        if(!current()) return;
         const eff=(st && st.reasoning_effort)||arg;
         showToast(BRAIN+' Reasoning effort: '+eff+' (saved; applies to next turn)');
         if(typeof _applyReasoningChip==='function') _applyReasoningChip(eff, st||{});
       })
       .catch(function(e){
+        if(!current()) return;
         showToast(BRAIN+' Failed to set effort: '+(e && e.message ? e.message : arg));
       });
     return true;
