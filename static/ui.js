@@ -2714,11 +2714,22 @@ function _isExternalMediaUrl(ref){
  *  literal text.
  *
  *  Kept in lockstep with MEDIA_TOKEN_MAX_LENGTH in api/helpers.py and
- *  _MEDIA_TAIL_MAX in static/messages.js. */
+ *  _MEDIA_TAIL_MAX in static/messages.js.
+ *
+ *  UNIT: UTF-16 CODE UNITS, in both languages. Deliberate: this cap bounds the
+ *  per-parser streaming buffer, that buffer is a JavaScript string, JavaScript
+ *  strings are stored as UTF-16, and `String.prototype.length` counts code
+ *  units — so code units are the unit that actually bounds the memory. Counting
+ *  code points instead would let a 4096-character astral token occupy 8192 code
+ *  units of the buffer. Python `len()` counts code points, so api/helpers.py
+ *  converts via media_token_length(); before it did, a token of 2049 U+1F600
+ *  characters measured 2049 in Python and 4098 here, and Python admitted a
+ *  token this side refused. */
 function _mediaTokenMaxLength(){ return 4096; }
 
 /** True when a capture is too long to be a legal MEDIA token. Measured on the
- *  RAW capture (quotes included), matching the streaming buffer's own bound.
+ *  RAW capture (quotes included), matching the streaming buffer's own bound, in
+ *  UTF-16 code units — `.length` IS that unit, so no conversion is needed here.
  *  Mirrors media_token_exceeds_max_length() in api/helpers.py. */
 function _mediaTokenExceedsMaxLength(ref){
   return String(ref == null ? '' : ref).length > _mediaTokenMaxLength();

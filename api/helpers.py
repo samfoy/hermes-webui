@@ -1420,20 +1420,50 @@ def external_media_url_hides_local_target(ref: str) -> bool:
 # from settled text, which is the property the streamed-vs-settled equality
 # tests pin.
 #
+# UNIT: **UTF-16 CODE UNITS**, in both languages. The choice is deliberate and
+# it is the unit that actually bounds the memory this cap exists to bound: the
+# unsettled candidate lives in a JavaScript string, JavaScript strings are
+# stored as UTF-16, and `String.prototype.length` counts code units. Measuring
+# in code points instead would let a 4096-character astral token occupy 8192
+# code units of the buffer the cap is meant to bound.
+#
+# Python `len()` counts CODE POINTS, so the two languages disagreed for any
+# token holding astral characters: a token of 2049 U+1F600 characters measures
+# 2049 in Python and 4098 in JavaScript, so Python admitted a token JavaScript
+# refused — for every astral token from 2049 through 4096 characters.
+# :func:`media_token_length` converts, so both languages return the same
+# verdict for ASCII, BMP, and astral input.
+#
 # Kept in lockstep with `_MEDIA_TAIL_MAX` in static/messages.js and
 # `MEDIA_TOKEN_MAX_LENGTH` in static/ui.js.
 MEDIA_TOKEN_MAX_LENGTH = 4096
+
+
+def media_token_length(ref: str) -> int:
+    """Length of *ref* in UTF-16 code units — the shared contract's unit.
+
+    Mirrors ``String.prototype.length``: a code point above U+FFFF needs a
+    surrogate pair and counts 2, everything else counts 1.
+
+    A lone surrogate counts 1, which is what JavaScript reports for one too.
+    Spelled as a sum rather than ``len(ref.encode("utf-16-le")) // 2`` because
+    that encode raises ``UnicodeEncodeError`` on a lone surrogate, and a lexical
+    predicate must always return a verdict. Cost is linear in the capture, which
+    the regex scan that produced the capture already paid.
+    """
+    return sum(2 if ord(ch) > 0xFFFF else 1 for ch in str(ref or ""))
 
 
 def media_token_exceeds_max_length(ref: str) -> bool:
     """True when a capture is too long to be a legal MEDIA token.
 
     Measured on the RAW capture (quotes included), because the streaming buffer
-    is bounded by the raw characters it holds, not by the unquoted value.
+    is bounded by the raw characters it holds, not by the unquoted value, and in
+    UTF-16 code units, because that is the unit that buffer is stored in.
 
     Mirrors ``_mediaTokenExceedsMaxLength()`` in static/ui.js.
     """
-    return len(str(ref or "")) > MEDIA_TOKEN_MAX_LENGTH
+    return media_token_length(ref) > MEDIA_TOKEN_MAX_LENGTH
 
 
 def media_token_pattern(extra_exclude: str = "", exclude_urls: bool = False) -> str:
