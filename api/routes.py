@@ -15415,6 +15415,11 @@ def handle_post(handler, parsed) -> bool:
                 enabled_toolsets=getattr(session, "enabled_toolsets", None),
                 context_length=getattr(session, "context_length", None),
                 threshold_tokens=getattr(session, "threshold_tokens", None),
+                # Reasoning effort is a per-session override (#6809). Without
+                # carrying it, the duplicate reads None and silently falls back
+                # to the profile-global default, so a source session set to
+                # xhigh produces a copy running at whatever the profile says.
+                reasoning_effort=getattr(session, "reasoning_effort", None),
                 truncation_watermark=getattr(session, "truncation_watermark", None),
                 truncation_boundary=getattr(session, "truncation_boundary", None),
                 # context_messages is the authoritative model-facing prefix — must be
@@ -16290,6 +16295,10 @@ def handle_post(handler, parsed) -> bool:
             enabled_toolsets=getattr(source, "enabled_toolsets", None),
             context_length=getattr(source, "context_length", None),
             threshold_tokens=getattr(source, "threshold_tokens", None),
+            # Reasoning effort is a per-session override (#6809). A branch that
+            # drops it reads None and silently falls back to the profile-global
+            # default, so a fork of an xhigh session runs at the profile value.
+            reasoning_effort=getattr(source, "reasoning_effort", None),
             # context_messages — truncated to fork prefix (not full parent copy)
             context_messages=copy.deepcopy(forked_context),
             # Gateway routing — inherit from source
@@ -23790,6 +23799,11 @@ def _handle_session_compression_recovery_start(handler, body):
                 enabled_toolsets=copy.deepcopy(getattr(source, "enabled_toolsets", None)),
                 context_length=getattr(source, "context_length", None),
                 threshold_tokens=getattr(source, "threshold_tokens", None),
+                # Reasoning effort is a per-session override (#6809). The
+                # focused continuation keeps the source lane's model settings,
+                # so it must keep the effort too; dropping it reads None and
+                # silently falls back to the profile-global default.
+                reasoning_effort=getattr(source, "reasoning_effort", None),
                 gateway_routing=copy.deepcopy(getattr(source, "gateway_routing", None)),
                 gateway_routing_history=copy.deepcopy(getattr(source, "gateway_routing_history", None) or []),
                 parent_session_id=getattr(source, "session_id", sid),
