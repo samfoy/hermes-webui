@@ -26,11 +26,15 @@ from pathlib import Path
 from api.config import STATE_DIR
 from api.helpers import (
     redact_session_data,
-    media_token_pattern,
     unquote_media_ref,
     is_external_media_url,
-    external_media_url_hides_local_target,
     media_token_exceeds_max_length,
+)
+from api.share_refs import (
+    SHARE_REFERENCE_RE,
+    media_ref_of_match,
+    public_reference_hides_local_target,
+    url_of_match,
 )
 # _redact_fn_cached is the ALWAYS-ON credential redactor (agent redactor with
 # force=True + local fallback regex). Unlike redact_session_data it does NOT
@@ -122,24 +126,23 @@ def _redact_share_paths(text: str, extra_paths) -> str:
     return text
 
 
-# Regex matching MEDIA:<path> references — same pattern that
-# _inlineMediaHtmlForRef() in ui.js handles when rendering messages.
-# Shares additionally exclude '>' so an inlined <img ...> tag terminates the
-# path. Shape comes from the shared helper so a spaced path resolves here the
-# same way it does in the renderer and the /api/media allow-list.
+# Regex matching EVERY URL-bearing token the share renderer can turn into a
+# live URL — the canonical `MEDIA:` token plus Markdown images/links, bare
+# absolute URLs, and relative `api/media?…` references. Shape and rationale
+# live in api/share_refs.py.
 #
-# NOTE: this deliberately does NOT pass exclude_urls=True. That option is a
-# negative lookahead at the current start position, so an external URL is
-# rejected by NOT MATCHING — and `re.sub` then resumes scanning one character
-# later, inside the very token it just refused. For
+# NOTE: the `MEDIA:` branch deliberately does NOT pass exclude_urls=True. That
+# option is a negative lookahead at the current start position, so an external
+# URL is rejected by NOT MATCHING — and `re.sub` then resumes scanning one
+# character later, inside the very token it just refused. For
 # `MEDIA:https://cdn.test/img/MEDIA:/etc/passwd.png` the outer token is skipped
 # and the nested `MEDIA:` matches as a fresh LOCAL token, so a legitimate
 # external URL gets its tail rewritten (and local paths get probed from share
 # text). Match the complete canonical token here and classify it in
 # _replace_ref(): match -> classify -> decide, which cannot restart mid-token.
-_SHARE_MEDIA_RE = re.compile(
-    media_token_pattern(extra_exclude=">")
-)
+# Every other branch obeys the same rule, so one refusal always consumes its
+# whole token.
+_SHARE_MEDIA_RE = SHARE_REFERENCE_RE
 
 # Max size (in bytes) for files we'll embed as base64 in a share snapshot.
 _SHARE_EMBED_MAX_BYTES = 512 * 1024  # 512 KiB
@@ -307,10 +310,23 @@ def _embed_share_media(text: str, *, allowed_roots: tuple[Path, ...] = ()) -> st
         return None
 
     def _replace_ref(m: re.Match) -> str:
+        # Non-`MEDIA:` branches: a Markdown image/link target, a bare absolute
+        # URL, or a relative reference to our own media route. Each of these is
+        # a live-URL sink on the share page (see api/share_refs.py for the sink
+        # inventory), so ONE fail-closed decision covers the WHOLE matched span
+        # here, exactly as the `MEDIA:` branch below does. Never embedded: the
+        # allowed-roots embed path exists for canonical `MEDIA:` tokens, and a
+        # Markdown target that survives is preserved byte-for-byte instead.
+        if m.group("media") is None:
+            if public_reference_hides_local_target(url_of_match(m)):
+                return _PLACEHOLDER
+            return m.group(0)
+
         # Quoted refs are captured with their quotes so the replaced span covers
         # the whole token; strip them before any path resolution, or a spaced
         # path that the renderer displays would be placeholdered here.
-        raw = unquote_media_ref(m.group(1) or "")
+        capture = media_ref_of_match(m)
+        raw = unquote_media_ref(capture)
         if not raw:
             return m.group(0)
         # An over-ceiling capture is not a legal MEDIA token (shared lexical
@@ -318,7 +334,7 @@ def _embed_share_media(text: str, *, allowed_roots: tuple[Path, ...] = ()) -> st
         # renderer turns it into a media node, so the snapshot must leave the
         # span exactly as prose rather than embed or placeholder it — otherwise
         # the share and the live view disagree about one token.
-        if media_token_exceeds_max_length(m.group(1) or ""):
+        if media_token_exceeds_max_length(capture):
             return m.group(0)
         # Classification happens HERE, on a token that was actually matched, and
         # is the only thing that decides external vs local. The pattern no longer
@@ -337,7 +353,7 @@ def _embed_share_media(text: str, *, allowed_roots: tuple[Path, ...] = ()) -> st
         # partial rewrite is exactly the bug that let the scanner resume inside
         # a token it had refused.
         if is_external_media_url(raw):
-            if external_media_url_hides_local_target(raw):
+            if public_reference_hides_local_target(raw):
                 return _PLACEHOLDER
             return m.group(0)
 
