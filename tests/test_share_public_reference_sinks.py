@@ -156,7 +156,7 @@ ATTACK_CASES = [
     ("nested MEDIA in query", f"![x](https://cdn.test/a.png?src=MEDIA:{_SECRET})"),
     ("nested MEDIA in fragment", f"![x](https://cdn.test/a.png#MEDIA:{_SECRET})"),
     ("nested file:// in query", f"![x](https://cdn.test/a.png?src=file://{_SECRET})"),
-    ("nested second http:// start", f"![x](https://cdn.test/a.png?u=http://evil.test/x.png)"),
+    ("nested loopback http:// start", "![x](https://cdn.test/a.png?u=http://127.0.0.1/x.png)"),
     ("nested relative api/media in query", f"![x](https://cdn.test/a.png?next=api/media?path={_SECRET})"),
     ("percent-encoded MEDIA", f"![x](https://cdn.test/a.png?src=%4dEDIA:{_SECRET})"),
     ("double-encoded MEDIA", f"![x](https://cdn.test/a.png?src=%254dEDIA:{_SECRET})"),
@@ -180,6 +180,7 @@ PRESERVE_CASES = [
     ("public path that merely mentions media", "![ok](https://cdn.test/media/photo.png)"),
     ("harmless percent in query", "![ok](https://cdn.test/a.png?pct=100%25)"),
     ("query naming another public asset", "![ok](https://cdn.test/a.png?next=/images/other.png)"),
+    ("query naming another public URL", "![ok](https://cdn.test/a.png?next=https://images.example.test/b.png)"),
 ]
 
 
@@ -309,14 +310,22 @@ def test_decode_probe_reports_a_value_still_changing_at_the_bound():
     assert (settled, still_changing) == ("100%", False)
 
 
-def test_nested_url_starts_are_a_superset_of_the_helper_markers():
-    """The nested-start scan must not drift from the shared marker tuple."""
-    from api.helpers import _LOCAL_TARGET_MARKERS
-    from api.share_refs import _NESTED_START_MARKERS
+def test_nested_local_markers_are_a_superset_of_the_helper_markers():
+    """The nested marker scan must not drift from the shared marker tuple.
 
-    assert set(_LOCAL_TARGET_MARKERS) <= set(_NESTED_START_MARKERS)
-    for extra in ("http://", "https://", "api/media"):
-        assert extra in _NESTED_START_MARKERS
+    ``http://`` / ``https://`` are deliberately NOT markers: a nested absolute
+    URL is a candidate to classify, not a verdict. See
+    ``test_nested_public_url_is_preserved_and_nested_local_is_refused``.
+    """
+    from api.helpers import _LOCAL_TARGET_MARKERS
+    from api.share_refs import _NESTED_LOCAL_MARKERS
+
+    assert set(_LOCAL_TARGET_MARKERS) <= set(_NESTED_LOCAL_MARKERS)
+    assert "api/media" in _NESTED_LOCAL_MARKERS
+    for scheme in ("http://", "https://"):
+        assert scheme not in _NESTED_LOCAL_MARKERS, (
+            f"{scheme!r} as an unconditional marker refuses every public proxy URL"
+        )
 
 
 @pytest.mark.parametrize(
@@ -331,7 +340,10 @@ def test_nested_url_starts_are_a_superset_of_the_helper_markers():
         ("api/media?path=/etc/shadow", True),
         ("http:///nohost.png", True),
         ("http://127.0.0.1:8080/img.png", True),
-        ("https://cdn.test/a.png?u=https://evil.test/x", True),
+        # A nested PUBLIC URL is a public asset, not a local target. `evil.test`
+        # is a public host: this row asserted True before, which locked in an
+        # over-block that contradicted the module's preservation contract.
+        ("https://cdn.test/a.png?u=https://evil.test/x", False),
         ("https://cdn.test/a.png#api/media?path=/x", True),
         ("mailto:someone@example.test", True),
         ("", True),
@@ -341,3 +353,96 @@ def test_public_reference_verdicts(value, hides):
     from api.share_refs import public_reference_hides_local_target
 
     assert public_reference_hides_local_target(value) is hides, value
+
+
+# ── Nested absolute URLs: classify the candidate, never refuse its scheme ─────
+# A nested absolute URL inside the outer URL's path, query, or fragment is a
+# CANDIDATE. Refusing it for carrying a scheme token destroys every legitimate
+# image-proxy / redirect URL, so each candidate is classified by the SAME rules
+# instead. The matrix covers all three positions in both directions.
+
+_NESTED_PRESERVE_CASES = [
+    # (label, value) -- outer public URL carrying a HARMLESS PUBLIC nested URL.
+    ("path public", "https://cdn.test/proxy/https://images.example.test/b.png"),
+    ("query public", "https://cdn.test/a.png?next=https://images.example.test/b.png"),
+    ("query public http", "https://cdn.test/a.png?next=http://images.example.test/b.png"),
+    ("fragment public", "https://cdn.test/a.png#https://images.example.test/b.png"),
+    ("two public candidates", "https://cdn.test/a.png?a=https://x.test/1.png&b=https://y.test/2.png"),
+    ("public with harmless query of its own", "https://cdn.test/a.png?u=https://x.test/b.png?w=800"),
+    ("public host merely named evil", "https://cdn.test/a.png?u=https://evil.test/x"),
+    ("percent-encoded nested public", "https://cdn.test/a.png?u=https%3A%2F%2Fx.test%2Fb.png"),
+]
+
+_NESTED_REJECT_CASES = [
+    # (label, value) -- the nested candidate is local, private, or our route.
+    ("path file scheme", "https://cdn.test/proxy/file:///etc/passwd.png"),
+    ("query file scheme", "https://cdn.test/a.png?next=file:///etc/passwd.png"),
+    ("fragment file scheme", "https://cdn.test/a.png#file:///etc/passwd.png"),
+    ("path loopback", "https://cdn.test/proxy/http://127.0.0.1/x.png"),
+    ("query loopback api/media", "https://cdn.test/a.png?next=http://127.0.0.1/api/media?path=/etc/shadow"),
+    ("fragment loopback", "https://cdn.test/a.png#http://127.0.0.1:8080/x.png"),
+    ("query rfc1918", "https://cdn.test/a.png?next=http://192.168.1.5/x.png"),
+    ("query link-local", "https://cdn.test/a.png?next=http://169.254.1.1/x.png"),
+    ("query rfc4193", "https://cdn.test/a.png?next=http://[fd00::1]/x.png"),
+    ("query localhost", "https://cdn.test/a.png?next=http://localhost:8787/x.png"),
+    ("path relative api/media", "https://cdn.test/api/media?path=/etc/shadow"),
+    ("query relative api/media", "https://cdn.test/a.png?next=api/media?path=/etc/shadow"),
+    ("fragment nested MEDIA token", "https://cdn.test/a.png#MEDIA:/etc/shadow.png"),
+    ("query nested MEDIA token", "https://cdn.test/a.png?src=MEDIA:/etc/shadow.png"),
+    ("nested empty host", "https://cdn.test/a.png?next=http:///nohost.png"),
+    ("public wrapper around private grandchild",
+     "https://cdn.test/a.png?u=https://proxy.test/p?next=http://10.0.0.7/x.png"),
+    ("percent-encoded nested loopback",
+     "https://cdn.test/a.png?u=http%3A%2F%2F127.0.0.1%2Fx.png"),
+]
+
+
+@pytest.mark.parametrize(
+    "label,value", _NESTED_PRESERVE_CASES, ids=[c[0] for c in _NESTED_PRESERVE_CASES]
+)
+def test_nested_public_candidate_is_preserved(label, value):
+    """An outer public URL carrying a harmless public URL is a public asset."""
+    from api.share_refs import public_reference_hides_local_target
+
+    assert public_reference_hides_local_target(value) is False, label
+    # And the whole token must survive publication byte-for-byte.
+    assert _published(f"![ok]({value})") == f"![ok]({value})", label
+
+
+@pytest.mark.parametrize(
+    "label,value", _NESTED_REJECT_CASES, ids=[c[0] for c in _NESTED_REJECT_CASES]
+)
+def test_nested_local_or_private_candidate_is_refused(label, value):
+    from api.share_refs import public_reference_hides_local_target
+
+    assert public_reference_hides_local_target(value) is True, label
+    assert _published(f"![x]({value})") == _PLACEHOLDER, label
+
+
+def test_nested_classification_is_bounded_and_fails_closed_at_the_bound():
+    """Recursion is bounded explicitly, and the bound REFUSES.
+
+    Each nested candidate is a strict substring of its parent's probe, so the
+    walk terminates on the value alone. The bound is the second guarantee, and
+    a candidate we never examined must not be published.
+    """
+    from api.share_refs import _MAX_NESTED_URL_DEPTH, public_reference_hides_local_target
+
+    def chain(levels: int) -> str:
+        hops = "".join(f"https://h{i}.test/p/" for i in range(1, levels + 1))
+        return f"https://h0.test/p/{hops}x.png"
+
+    # Every hop is a public host, so anything within the bound is preserved.
+    for levels in range(0, _MAX_NESTED_URL_DEPTH + 1):
+        assert public_reference_hides_local_target(chain(levels)) is False, levels
+
+    # One hop past the bound is refused even though every host is public.
+    assert public_reference_hides_local_target(chain(_MAX_NESTED_URL_DEPTH + 1)) is True
+
+    # A private host buried past the bound is refused too — the bound can only
+    # make the answer stricter, never looser.
+    deep_private = (
+        "https://h0.test/p/https://h1.test/p/https://h2.test/p/"
+        "https://h3.test/p/http://127.0.0.1/x.png"
+    )
+    assert public_reference_hides_local_target(deep_private) is True

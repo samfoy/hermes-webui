@@ -79,21 +79,43 @@ def decode_probe_bounded(value: str, *, rounds: int = _DECODE_ROUNDS) -> tuple[s
     return current, unquote(current) != current
 
 
-# Nested URL starts that mean "this value leads back to a local or
-# authenticated target". A superset of the marker tuple in api/helpers.py,
-# imported rather than restated so the two can never drift:
+# Nested substrings that mean "this value leads back to a local or
+# authenticated target" WHATEVER else the value carries. A superset of the
+# marker tuple in api/helpers.py, imported rather than restated so the two can
+# never drift, plus:
 #
-# * ``http://`` / ``https://`` -- a SECOND absolute URL inside the path, query,
-#   or fragment of the first. The token we are judging already carries its own
-#   scheme, so another one is smuggled, not structural.
 # * ``api/media`` -- the slash-less spelling of our own route, which is exactly
-#   the form ``_isSafeUrl()`` accepts as an image src.
+#   the form ``_isSafeUrl()`` accepts as an image src. The helper tuple only
+#   carries the rooted ``/api/media`` spelling.
+#
+# ``http://`` and ``https://`` are deliberately ABSENT. A second absolute URL
+# inside the path, query, or fragment of the first is a CANDIDATE to classify,
+# not a verdict: an outer public URL carrying a harmless nested public URL (a
+# CDN or image proxy passing `?next=https://images.example.test/b.png`) is a
+# genuine public asset, and refusing it for owning a scheme token both
+# over-blocks and contradicts the byte-for-byte preservation contract above.
+# :data:`_NESTED_CANDIDATE_RE` finds those candidates and
+# :func:`public_reference_hides_local_target` recurses into each one.
 #
 # The netloc is deliberately NOT probed, so an ordinary public CDN host is never
 # refused for its name alone.
-_NESTED_START_MARKERS: tuple[str, ...] = tuple(
-    dict.fromkeys(_LOCAL_TARGET_MARKERS + ("http://", "https://", "api/media"))
+_NESTED_LOCAL_MARKERS: tuple[str, ...] = tuple(
+    dict.fromkeys(_LOCAL_TARGET_MARKERS + ("api/media",))
 )
+
+# A nested ABSOLUTE http(s) URL inside a decoded path/query/fragment probe. The
+# run is greedy up to the characters that can never appear inside a URL, so an
+# ambiguous boundary (`&`, `,`) is swallowed INTO the candidate rather than
+# cutting it short: a longer candidate can only carry more evidence, so the
+# ambiguity resolves in the fail-closed direction. `file://` is not a candidate
+# because it is already an unconditional marker above.
+_NESTED_CANDIDATE_RE = re.compile(r"""(?i)https?://[^\s<>"']*""")
+
+# How many levels of nesting get classified before the value is refused. Each
+# recursion step judges a STRICT substring of its parent's probe, so recursion
+# terminates on the value alone; this bound is the second, explicit guarantee
+# and it fails CLOSED at the limit rather than accepting an unexamined tail.
+_MAX_NESTED_URL_DEPTH = 3
 
 _FILE_SCHEME_RE = re.compile(r"(?i)^file://")
 _HTTP_SCHEME_RE = re.compile(r"(?i)^https?://")
@@ -103,7 +125,7 @@ _HTTP_SCHEME_RE = re.compile(r"(?i)^https?://")
 _API_MEDIA_RE = re.compile(r"(?i)^/?api/media\?")
 
 
-def public_reference_hides_local_target(value: str) -> bool:
+def public_reference_hides_local_target(value: str, *, _depth: int = 0) -> bool:
     """True when *value* must NOT be published into a public share snapshot.
 
     Covers every shape :data:`SHARE_REFERENCE_RE` can match, and answers for
@@ -119,11 +141,24 @@ def public_reference_hides_local_target(value: str) -> bool:
       already refuses (private host, empty host, unparseable, or a marker in
       the decoded path/query/fragment).
     * an http(s) URL whose probe is still percent-decoding at the bound.
-    * an http(s) URL carrying a nested absolute or relative URL start.
+    * an http(s) URL carrying a nested local marker (``file://``, a nested
+      ``MEDIA:``, or either spelling of our own ``/api/media`` route) anywhere
+      in its decoded path, query, or fragment.
+    * an http(s) URL carrying a nested absolute http(s) URL that this same
+      function refuses -- classified by recursion, so a private or
+      authenticated descendant is caught however deeply it is wrapped.
     * anything else -- a shape we cannot reason about is refused, not accepted.
 
     Preserved: an ordinary public http(s) URL, including one with a harmless
-    query string. Over-blocking a genuine public asset is also a failure.
+    query string, and including one whose query or fragment carries another
+    HARMLESS PUBLIC URL (the image-proxy shape). Over-blocking a genuine public
+    asset is also a failure, and a public host is not a local target.
+
+    *_depth* is the recursion level. It is internal: each nested candidate is a
+    STRICT substring of its parent's probe, so recursion terminates on the
+    value alone, and :data:`_MAX_NESTED_URL_DEPTH` is the second, explicit
+    guarantee. At the bound the answer is True -- an unexamined nested tail is
+    refused, never accepted.
     """
     v = str(value or "").strip()
     if not v:
@@ -150,7 +185,24 @@ def public_reference_hides_local_target(value: str) -> bool:
     if still_changing:
         return True
     lowered = decoded.lower()
-    return any(marker in lowered for marker in _NESTED_START_MARKERS)
+    if any(marker in lowered for marker in _NESTED_LOCAL_MARKERS):
+        return True
+    return any(
+        _nested_candidate_hides_local_target(candidate, depth=_depth)
+        for candidate in _NESTED_CANDIDATE_RE.findall(decoded)
+    )
+
+
+def _nested_candidate_hides_local_target(candidate: str, *, depth: int) -> bool:
+    """Classify one nested absolute http(s) *candidate* found inside a probe.
+
+    Split out so the recursion bound is checked in exactly one place. Refuses
+    at the bound: a candidate we did not get to examine is not a candidate we
+    may publish.
+    """
+    if depth >= _MAX_NESTED_URL_DEPTH:
+        return True
+    return public_reference_hides_local_target(candidate, _depth=depth + 1)
 
 
 # ── The tokenizer ────────────────────────────────────────────────────────────
