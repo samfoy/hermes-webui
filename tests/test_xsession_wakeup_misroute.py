@@ -340,6 +340,7 @@ def test_turn_identity_binder_sets_session_cwd():
             "in-process agent still resolves the server's launch directory"
         )
         assert rc._SESSION_CWD.get() == "/tmp"
+        assert rc._session_cwd_override() == "/tmp"
         assert str(rc.resolve_agent_cwd()) == "/tmp"
     finally:
         streaming._reset_turn_session_identity(tokens)
@@ -383,6 +384,7 @@ def test_concurrent_turns_keep_their_own_workspace_cwd():
             # Both turns are now bound; each must still read its OWN workspace.
             barrier.wait(timeout=5)
             seen[label] = rc._SESSION_CWD.get()
+            seen[label] = rc._session_cwd_override()
         finally:
             streaming._reset_turn_session_identity(tokens)
 

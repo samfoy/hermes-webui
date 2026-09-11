@@ -139,3 +139,28 @@ def is_plugin_model_provider(provider_id: str) -> bool:
     if not pid or pid in _webui_static_provider_ids():
         return False
     return pid in plugin_model_provider_profiles()
+
+
+def plugin_model_provider_auth_status(provider_id: str) -> dict[str, Any] | None:
+    """Auth health from a plugin provider that implements ``auth_status()``.
+
+    Optional hook. A provider that authenticates outside Hermes (an external CLI's
+    token store, a local OIDC session) is the only component that knows whether
+    that credential still works, and the generic key check cannot tell a live
+    token from a stale one. Providers without the hook return None and behave as
+    before.
+
+    Must never raise: this runs while building the Settings payload.
+    """
+    profile = plugin_model_provider_profiles().get((provider_id or "").strip().lower())
+    if profile is None:
+        return None
+    hook = getattr(profile, "auth_status", None)
+    if not callable(hook):
+        return None
+    try:
+        status = hook()
+    except Exception:
+        logger.debug("Plugin auth_status failed for %s", provider_id, exc_info=True)
+        return None
+    return status if isinstance(status, dict) else None

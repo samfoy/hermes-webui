@@ -38,6 +38,7 @@ from api.workspace import get_last_workspace
 from api.usage import prompt_cache_hit_percent
 from api.agent_sessions import (
     _is_continuation_session,
+    EXTERNAL_AGENT_SOURCES,
     is_cli_session_row,
     normalize_agent_session_source,
     open_state_db_readonly,
@@ -58,6 +59,13 @@ WEBHOOK_PROJECT_CHIP_LIMIT = 200
 # higher project-chip cap so project-assigned kanban rows stay addressable when
 # the toggle is on, without letting them dominate the default sidebar window.
 KANBAN_PROJECT_CHIP_LIMIT = 200
+# How many external-agent sessions (pi, Claude Code imports living in state.db)
+# to surface. Same rationale as CRON_PROJECT_CHIP_LIMIT: the default sidebar
+# window reads only CLI_VISIBLE_SESSION_LIMIT (20) rows ordered by recency, so
+# an agent whose sessions are older than the 20 newest rows is read out of
+# existence before classification ever runs. Measured: with limit=20 the window
+# held 14 webui + 6 subagent rows and ZERO of 390 pi rows.
+EXTERNAL_AGENT_SESSION_LIMIT = 200
 _CLI_SESSIONS_CACHE_TTL_SECONDS = 5.0
 # While a turn is actively streaming, hold the CLI/cron projection longer than
 # one poll interval (mirrors the route-level #4808 hold-down). The frontend
@@ -1215,6 +1223,7 @@ class Session:
                  workspace=str(DEFAULT_WORKSPACE), created_workspace=None,
                  model=DEFAULT_MODEL,
                  model_provider=None,
+                 reasoning_effort=None,
                  messages=None, created_at=None, updated_at=None,
                  tool_calls=None, pinned: bool=False, archived: bool=False,
                  project_id: str=None, profile=None,
@@ -1282,6 +1291,7 @@ class Session:
         )
         self.model = model
         self.model_provider = str(model_provider).strip().lower() if model_provider else None
+        self.reasoning_effort = reasoning_effort
         # #5979: signature of the model the user DELIBERATELY picked this session
         # (``"<model>\x1f<provider>"``), or None. Used by the streaming resolver
         # to preserve a custom-proxy vendor namespace on a COLD catalog ONLY when
@@ -1412,7 +1422,7 @@ class Session:
         # without parsing the full messages array (which may be 400KB+).
         # Fields are listed in the order they should appear in the JSON file.
         METADATA_FIELDS = [
-            'session_id', 'title', 'workspace', 'created_workspace', 'model', 'model_provider', 'model_explicit_pick_signature', 'created_at', 'updated_at',
+            'session_id', 'title', 'workspace', 'created_workspace', 'model', 'model_provider', 'reasoning_effort', 'model_explicit_pick_signature', 'created_at', 'updated_at',
             'pinned', 'archived', 'project_id', 'profile',
             'input_tokens', 'output_tokens', 'estimated_cost',
             'cache_read_tokens', 'cache_write_tokens',
@@ -7650,6 +7660,7 @@ def _load_cli_sessions_uncached(
     cron_project_limit: int | None | bool = CRON_PROJECT_CHIP_LIMIT,
     webhook_project_limit: int | None | bool = WEBHOOK_PROJECT_CHIP_LIMIT,
     kanban_project_limit: int | None | bool = KANBAN_PROJECT_CHIP_LIMIT,
+    external_agent_limit: int | None | bool = EXTERNAL_AGENT_SESSION_LIMIT,
     include_claude_code: bool = True,
 ) -> list:
     cli_sessions = []
@@ -7827,6 +7838,11 @@ def _load_cli_sessions_uncached(
             '_lineage_tip_id': row.get('_lineage_tip_id'),
             '_compression_segment_count': row.get('_compression_segment_count'),
             'is_cli_session': is_cli_session_row({**row, **_source_meta}),
+            # External-agent transcripts (pi) are records Hermes imported, not
+            # Hermes conversations: mark them read-only so the UI hides compose
+            # affordances, matching the synthesized Claude Code / Codex rows and
+            # the hard chat-start refusal for session_source='external_agent'.
+            'read_only': _source_meta.get('session_source') == 'external_agent',
         })
 
     if source_filter is not None:
@@ -8034,6 +8050,76 @@ def _load_cli_sessions_uncached(
         except Exception:
             logger.debug("Kanban sidebar second pass failed", exc_info=True)
 
+    # --- Second pass: external-agent sessions (pi) that the default window
+    # squeezed out. The first pass reads only CLI_VISIBLE_SESSION_LIMIT (20)
+    # rows ordered by recency, so an external agent whose sessions are all
+    # older than the 20 newest rows never reaches the classifier at all —
+    # measured: the 20-row window held 14 webui + 6 subagent rows and ZERO of
+    # 390 pi rows. Same shape of fix as the cron/webhook passes above, and the
+    # same reason: classification cannot rescue a row that was never read.
+    #
+    # Skipped when it provably cannot add anything, so the common paths keep
+    # their existing DB-read count: a source-filtered scan already targets one
+    # source, and an uncapped first pass (visible_session_limit=None) already
+    # read every row there is.
+    if (
+        external_agent_limit is not False
+        and source_filter is None
+        and visible_session_limit is not None
+    ):
+        existing_sids = {s['session_id'] for s in cli_sessions}
+        try:
+            for row in read_importable_agent_session_rows(
+                db_path,
+                limit=external_agent_limit,
+                log=logger,
+                exclude_sources=None,
+                include_sources=tuple(sorted(EXTERNAL_AGENT_SOURCES)),
+            ):
+                sid = row['id']
+                if sid in existing_sids:
+                    continue
+                _source = row['source'] or ''
+                if _source not in EXTERNAL_AGENT_SOURCES:
+                    continue
+                _source_meta = normalize_agent_session_source(_source)
+                raw_ts = row['last_activity'] or row['started_at']
+                _title = row['title']
+                _sidecar_meta = _state_projection_sidecar_metadata(sid)
+                if _sidecar_meta.get('title'):
+                    _title = _sidecar_meta['title']
+                _archived = bool(_sidecar_meta.get('archived'))
+                cli_sessions.append({
+                    'session_id': sid,
+                    'title': _title or f"{_source_meta.get('source_label') or _source} session",
+                    'workspace': _cli_workspace(),
+                    'model': row['model'] or None,
+                    'message_count': row['message_count'] or row['actual_message_count'] or 0,
+                    'created_at': row['started_at'],
+                    'updated_at': raw_ts,
+                    'last_message_at': raw_ts,
+                    'pinned': False,
+                    'archived': _archived,
+                    'project_id': None,
+                    'profile': profile_value,
+                    'source': _source,
+                    'source_tag': _source,
+                    'raw_source': _source_meta.get('raw_source'),
+                    'session_source': _source_meta.get('session_source'),
+                    'source_label': _source_meta.get('source_label'),
+                    'end_reason': row.get('end_reason'),
+                    'actual_message_count': row.get('actual_message_count'),
+                    'user_message_count': row.get('actual_user_message_count'),
+                    '_lineage_root_id': row.get('_lineage_root_id'),
+                    '_lineage_tip_id': row.get('_lineage_tip_id'),
+                    '_compression_segment_count': row.get('_compression_segment_count'),
+                    'is_cli_session': is_cli_session_row({**row, **_source_meta}),
+                    'read_only': True,
+                })
+                existing_sids.add(sid)
+        except Exception:
+            logger.debug("External-agent second pass failed", exc_info=True)
+
     return cli_sessions
 
 
@@ -8097,6 +8183,7 @@ def get_cli_sessions(
                     'cron_project_limit': None,
                     'webhook_project_limit': None,
                     'kanban_project_limit': None,
+                    'external_agent_limit': EXTERNAL_AGENT_SESSION_LIMIT,
                 }
                 if loader_supports_include_claude_code:
                     load_kwargs['include_claude_code'] = include_claude_code and idx == 0

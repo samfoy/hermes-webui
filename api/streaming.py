@@ -2728,6 +2728,15 @@ def _build_agent_thread_env(profile_runtime_env: dict | None, workspace: str, se
         'HERMES_SESSION_KEY': session_id,
         'HERMES_SESSION_ID': session_id,
         'HERMES_SESSION_PLATFORM': 'webui',
+        # Assert the session source explicitly instead of letting the agent
+        # inherit one. run_agent._session_source_for_agent() prefers
+        # HERMES_SESSION_SOURCE over the platform, so when the server is
+        # launched from inside a Hermes TUI/CLI session that shell's stale
+        # value (e.g. 'tui') leaks in and every WebUI session lands in
+        # state.db mislabeled — which then maps to session_source='cli' in
+        # normalize_agent_session_source() and lands in the wrong sidebar
+        # bucket. Setting it here makes the source authoritative.
+        'HERMES_SESSION_SOURCE': 'webui',
         # process_complete agent-wakeup wiring (ours-original, Option B): the
         # terminal_tool watcher routing gate (terminal_tool.py:~1940) reads
         # HERMES_SESSION_CHAT_ID to populate pending_watchers for WebUI
@@ -5870,7 +5879,17 @@ def _deduplicate_context_messages(messages):
                     continue
             elif prior_exact_idx is not None:
                 continue
-            user_exact_index[user_exact_key] = len(deduped)
+            # Record the index ONLY when this message actually lands in
+            # ``deduped``. The ``key in seen`` branch below drops the message
+            # without appending, so registering ``len(deduped)`` up front left
+            # ``user_exact_index`` pointing one past the end. A later exact
+            # duplicate carrying ``_active_turn_token`` then took the
+            # ``deduped[prior_exact_idx] = msg`` path above and raised
+            # IndexError, killing the turn after its text had already streamed
+            # (ambient meeting-capture sessions replay identical user rows, so
+            # they hit this constantly).
+            if key is None or key not in seen:
+                user_exact_index[user_exact_key] = len(deduped)
         if key is not None and key in seen:
             continue
         if key is not None:
@@ -10510,7 +10529,12 @@ def _run_agent_streaming(
             # the key is absent or invalid, pass None → agent uses its default.
             try:
                 _effort_cfg = _cfg.get('agent', {}) if isinstance(_cfg, dict) else {}
-                _effort_raw = _effort_cfg.get('reasoning_effort') if isinstance(_effort_cfg, dict) else None
+                _session_effort = getattr(_session_meta, 'reasoning_effort', None) if _session_meta else None
+                _effort_raw = (
+                    _session_effort
+                    if _session_effort is not None
+                    else _effort_cfg.get('reasoning_effort') if isinstance(_effort_cfg, dict) else None
+                )
                 _effort = coerce_reasoning_effort_for_model(
                     _effort_raw,
                     resolved_model,

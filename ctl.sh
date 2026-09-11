@@ -637,6 +637,18 @@ start_cmd() {
     cd "${REPO_ROOT}"
     trap '' HUP
     export HERMES_WEBUI_PRESERVE_ENV=1
+    # Scrub inherited per-session vars before exec'ing the daemon. When ctl.sh
+    # is run from inside a Hermes TUI/CLI session, that session's HERMES_SESSION_*
+    # values are inherited by the server and then by every agent thread it
+    # spawns, so new WebUI sessions get stamped with the launching session's
+    # source/id instead of their own. HERMES_WEBUI_PRESERVE_ENV=1 above makes
+    # the leaked values stickier, so unset them explicitly.
+    unset HERMES_SESSION_SOURCE HERMES_SESSION_PLATFORM HERMES_SESSION_ID \
+          HERMES_SESSION_KEY HERMES_SESSION_CHAT_ID HERMES_SESSION_CHAT_NAME \
+          HERMES_SESSION_CHAT_TYPE HERMES_SESSION_THREAD_ID \
+          HERMES_SESSION_MESSAGE_ID HERMES_SESSION_USER_ID \
+          HERMES_SESSION_USER_NAME HERMES_SESSION_PROFILE \
+          HERMES_UI_SESSION_ID HERMES_GATEWAY_SESSION
     exec nohup "${python_exe}" "${REPO_ROOT}/bootstrap.py" --no-browser --foreground --host "${CTL_HOST}" "${CTL_PORT}" ${CTL_BOOTSTRAP_ARGS[@]+"${CTL_BOOTSTRAP_ARGS[@]}"}
   ) >> "${LOG_FILE}" 2>&1 &
   pid=$!

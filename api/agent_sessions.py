@@ -68,12 +68,15 @@ SOURCE_LABELS = {
     'acp': 'ACP',
     'api_server': 'API',
     'cli': 'CLI',
+    'claude_code': 'Claude Code',
+    'codex': 'Codex',
     'cron': 'Cron',
     'discord': 'Discord',
     'email': 'Email',
     'kanban': 'Kanban',
     'wecom': 'WeCom',
     'wecom_callback': 'WeCom Callback',
+    'pi': 'pi',
     'slack': 'Slack',
     'telegram': 'Telegram',
     'tool': 'Tool',
@@ -82,6 +85,26 @@ SOURCE_LABELS = {
     'webui': 'WebUI',
     'weixin': 'Weixin',
     'matrix': 'Matrix',
+}
+
+# External coding agents whose transcripts Hermes only reads. Their rows reach
+# WebUI two different ways, and both must classify identically:
+#
+# - Claude Code / Codex rows are synthesized on disk by
+#   ``get_claude_code_sessions()``, which hardcodes
+#   ``session_source='external_agent'`` and never calls this normalizer.
+# - 'pi' rows are imported into the agent's state.db (source='pi') by
+#   ~/.hermes/scripts/pi_session_import.py, so they DO flow through here.
+#
+# Classifying them 'other' makes them invisible in both sidebar buckets (see
+# the 'acp' comment below). 'external_agent' files them into the CLI sidebar
+# bucket via the ``is_cli_session_row`` fallthrough while keeping them
+# read-only — a hard refusal for chat-start, which is correct: an external
+# agent's transcript is a record to read, not a Hermes conversation to resume.
+EXTERNAL_AGENT_SOURCES = {
+    'claude_code',
+    'codex',
+    'pi',
 }
 
 
@@ -96,6 +119,10 @@ def normalize_agent_session_source(raw_source: str | None) -> dict:
 
     if raw == 'webui':
         session_source = 'webui'
+    elif raw in EXTERNAL_AGENT_SOURCES:
+        # Read-only transcripts from an external coding agent (pi, Claude Code,
+        # Codex). Filed into the CLI sidebar bucket, never writable.
+        session_source = 'external_agent'
     elif raw in {'acp', 'cli', 'tui'}:
         # 'acp' (Agent Client Protocol adapter — Zed, external device bridges)
         # is a local interactive agent client like the CLI/TUI: its sessions
@@ -251,6 +278,13 @@ def is_cli_session_row(row: dict) -> bool:
     # real title, so they'd otherwise fall through to the conservative
     # default-title gate below and be misclassified as non-CLI.
     if source in {"external_agent", "external-agent"}:
+        return True
+    # Raw rows that never passed through normalize_agent_session_source() (state
+    # rows handed straight to this classifier) still carry the raw agent name in
+    # one of the source fields. 'pi' rows come from state.db this way, so match
+    # them here too or the same row classifies differently depending on which
+    # call path reached it.
+    if {source, source_tag, raw_source, source_name} & EXTERNAL_AGENT_SOURCES:
         return True
     if (
         source_tag in {"acp", "cli", "tui"}

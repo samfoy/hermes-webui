@@ -2962,6 +2962,7 @@ from api.helpers import (
     strip_public_internal_fields,
     _redact_text,
     _CLIENT_DISCONNECT_ERRORS,
+    media_token_pattern,
 )
 from api.agent_health import build_agent_health_payload
 from api.gateway_chat import gateway_chat_config_status
@@ -13948,12 +13949,15 @@ def handle_get(handler, parsed) -> bool:
         model_id = (query.get("model", [""])[0] or "").strip() or None
         provider_id = (query.get("provider", [""])[0] or "").strip() or None
         base_url = (query.get("base_url", [""])[0] or "").strip() or None
+        session_id = (query.get("session_id", [""])[0] or "").strip()
+        session = get_session(session_id, metadata_only=True) if session_id else None
         return j(
             handler,
             get_reasoning_status(
                 model_id=model_id,
                 provider_id=provider_id,
                 base_url=base_url,
+                reasoning_effort=getattr(session, "reasoning_effort", None),
             ),
         )
 
@@ -15535,6 +15539,22 @@ def handle_post(handler, parsed) -> bool:
                 model_id = str(body.get("model") or "").strip() or None
                 provider_id = str(body.get("provider") or "").strip() or None
                 base_url = str(body.get("base_url") or "").strip() or None
+                session_id = str(body.get("session_id") or "").strip()
+                if session_id:
+                    raw = str(effort or "").strip().lower()
+                    if raw and raw != "none" and raw not in api_config.VALID_REASONING_EFFORTS:
+                        raise ValueError(f"Unknown reasoning effort '{effort}'.")
+                    session = _get_or_materialize_session(session_id)
+                    with _get_session_agent_lock(session_id):
+                        session.reasoning_effort = raw
+                        session.save()
+                    api_config._evict_session_agent(session_id)
+                    return j(handler, get_reasoning_status(
+                        model_id=model_id,
+                        provider_id=provider_id,
+                        base_url=base_url,
+                        reasoning_effort=raw,
+                    ))
                 return j(
                     handler,
                     set_reasoning_effort(
@@ -16552,7 +16572,9 @@ def handle_post(handler, parsed) -> bool:
             return bad(handler, _sanitize_error(e), 500)
 
         try:
-            return j(handler, {"output": execute_plugin_command(command)})
+            return j(handler, {"output": execute_plugin_command(
+                command, session_id=str(body.get("session_id", "") or "")
+            )})
         except ValueError as e:
             return bad(handler, str(e), 400)
         except KeyError:
@@ -20235,7 +20257,7 @@ def _serve_inline_html_preview(handler, target: Path, cache_control: str, *, csp
     return True
 
 
-_MEDIA_TOKEN_RE = re.compile(r"MEDIA:([^\s\)\]]+)")
+_MEDIA_TOKEN_RE = re.compile(media_token_pattern())
 
 
 def _message_content_text(content) -> str:

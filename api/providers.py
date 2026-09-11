@@ -2597,6 +2597,24 @@ def get_providers() -> dict[str, Any]:
         # Determine key source
         key_source = "none"
         auth_error = None
+
+        # Plugin providers can report live auth health even when a key exists:
+        # kiro authenticates against kiro-cli's own token store, so a present
+        # credential says nothing about whether the login is still valid. Without
+        # this, an expired login degraded to a short curated model list with no
+        # signal in the UI at all.
+        if is_plugin_model_provider(pid):
+            try:
+                from .plugin_providers import plugin_model_provider_auth_status
+                _live_status = plugin_model_provider_auth_status(pid)
+            except Exception:
+                logger.debug("Plugin auth_status lookup failed for %s", pid, exc_info=True)
+                _live_status = None
+            if isinstance(_live_status, dict):
+                _live_error = _live_status.get("error")
+                if _live_error:
+                    auth_error = str(_live_error)
+
         if is_oauth:
             key_source = "oauth"
             # Check if actually authenticated via hermes_cli.

@@ -45,7 +45,58 @@ def _max_extracted_bytes() -> int:
 _MAX_EXTRACTED_BYTES = 10 * MAX_UPLOAD_BYTES
 
 
-def parse_multipart(rfile, content_type, content_length) -> tuple:
+# Cap a single chunked-encoding chunk-size line. A well-formed line is a few
+# bytes ("1a3f\r\n"); a bounded readline stops a peer from sending an unbounded
+# line with no newline and exhausting memory.
+_CHUNK_LINE_LIMIT = 1024
+
+
+def _read_chunked_upload(rfile, max_bytes: int) -> bytes:
+    """Decode an HTTP/1.1 ``Transfer-Encoding: chunked`` upload body.
+
+    Mirrors api.helpers._read_chunked_body but operates on a raw ``rfile`` and
+    uses the upload size cap, because uploads are binary multipart rather than
+    JSON and must not be routed through the JSON body reader.
+
+    ``max_bytes`` is enforced across the SUM of all chunks, so chunked framing
+    cannot be used to bypass the upload size limit.
+    """
+    chunks = []
+    total = 0
+    while True:
+        line = rfile.readline(_CHUNK_LINE_LIMIT + 1)
+        if not line:
+            raise ValueError('Malformed chunked upload: unexpected end of stream')
+        if len(line) > _CHUNK_LINE_LIMIT:
+            raise ValueError('Malformed chunked upload: chunk-size line too long')
+        # Strip any chunk extensions (";name=value") before parsing the size.
+        size_token = line.split(b';', 1)[0].strip()
+        try:
+            size = int(size_token, 16)
+        except ValueError:
+            raise ValueError(f'Malformed chunked upload: bad chunk size {size_token!r}') from None
+        if size < 0:
+            raise ValueError('Malformed chunked upload: negative chunk size')
+        if size == 0:
+            # Consume trailers up to the terminating blank line.
+            while True:
+                trailer = rfile.readline(_CHUNK_LINE_LIMIT + 1)
+                if not trailer or trailer in (b'\r\n', b'\n'):
+                    break
+            break
+        total += size
+        if total > max_bytes:
+            raise ValueError(f'Upload too large (max {max_bytes} bytes)')
+        data = rfile.read(size)
+        if data is None or len(data) != size:
+            raise ValueError('Malformed chunked upload: truncated chunk')
+        chunks.append(data)
+        # Each chunk is followed by CRLF, which must be consumed.
+        rfile.read(2)
+    return b''.join(chunks)
+
+
+def parse_multipart(rfile, content_type, content_length, handler=None) -> tuple:
     import re as _re, email.parser as _ep
     # Imported locally (not just module-level) so the function stays
     # self-contained — some tests exec() this function's source in an isolated
@@ -62,15 +113,30 @@ def parse_multipart(rfile, content_type, content_length) -> tuple:
     # NEGATIVE Content-Length must never reach rfile.read(<0), which reads the
     # stream unbounded (read(-1) == read-to-EOF) and bypasses the per-handler
     # size cap. Reject anything not in [0, MAX_UPLOAD_BYTES].
-    try:
-        length = int(content_length)
-    except (TypeError, ValueError):
-        raise ValueError('Invalid Content-Length') from None
-    if length < 0:
-        raise ValueError('Invalid Content-Length (negative)')
-    if length > _MAX_UPLOAD_BYTES:
-        raise ValueError(f'Upload too large (max {_MAX_UPLOAD_BYTES} bytes)')
-    raw = rfile.read(length)
+    #
+    # Chunked framing is checked FIRST: RFC 7230 gives Transfer-Encoding
+    # precedence over Content-Length, and a reverse proxy can send both. Amazon
+    # Tunnels re-frames a Content-Length upload as chunked, which left
+    # Content-Length absent (parsed as 0) and made rfile.read(0) return no
+    # bytes. The multipart parse then found no parts, so the endpoint answered
+    # 400 "No file field in request" while the client saw its write fail with
+    # EPIPE. That failure appeared only through the tunnel, never on direct
+    # localhost access.
+    transfer_encoding = ''
+    if handler is not None:
+        transfer_encoding = (handler.headers.get('Transfer-Encoding') or '').strip().lower()
+    if 'chunked' in transfer_encoding:
+        raw = _read_chunked_upload(rfile, _MAX_UPLOAD_BYTES)
+    else:
+        try:
+            length = int(content_length)
+        except (TypeError, ValueError):
+            raise ValueError('Invalid Content-Length') from None
+        if length < 0:
+            raise ValueError('Invalid Content-Length (negative)')
+        if length > _MAX_UPLOAD_BYTES:
+            raise ValueError(f'Upload too large (max {_MAX_UPLOAD_BYTES} bytes)')
+        raw = rfile.read(length)
     fields = {}
     files = {}
     delimiter = b'--' + boundary
@@ -210,7 +276,7 @@ def handle_upload(handler):
         content_length = int(handler.headers.get('Content-Length', 0) or 0)
         if content_length > MAX_UPLOAD_BYTES:
             return j(handler, {'error': f'File too large (max {MAX_UPLOAD_BYTES//1024//1024}MB)'}, status=413)
-        fields, files = parse_multipart(handler.rfile, content_type, content_length)
+        fields, files = parse_multipart(handler.rfile, content_type, content_length, handler)
         session_id = fields.get('session_id', '')
         if 'file' not in files:
             return j(handler, {'error': 'No file field in request'}, status=400)
@@ -388,7 +454,7 @@ def handle_upload_extract(handler):
         content_length = int(handler.headers.get('Content-Length', 0) or 0)
         if content_length > MAX_UPLOAD_BYTES:
             return j(handler, {'error': f'File too large (max {MAX_UPLOAD_BYTES//1024//1024}MB)'}, status=413)
-        fields, files = parse_multipart(handler.rfile, content_type, content_length)
+        fields, files = parse_multipart(handler.rfile, content_type, content_length, handler)
         session_id = fields.get('session_id', '')
         if 'file' not in files:
             return j(handler, {'error': 'No file field in request'}, status=400)
@@ -420,7 +486,7 @@ def handle_transcribe(handler):
         content_length = int(handler.headers.get('Content-Length', 0) or 0)
         if content_length > MAX_UPLOAD_BYTES:
             return j(handler, {'error': f'File too large (max {MAX_UPLOAD_BYTES//1024//1024}MB)'}, status=413)
-        fields, files = parse_multipart(handler.rfile, content_type, content_length)
+        fields, files = parse_multipart(handler.rfile, content_type, content_length, handler)
         if 'file' not in files:
             return j(handler, {'error': 'No file field in request'}, status=400)
         filename, file_bytes = files['file']
@@ -605,7 +671,7 @@ def handle_workspace_upload(handler):
         if content_length > MAX_UPLOAD_BYTES:
             return j(handler, {'error': f'File too large (max {MAX_UPLOAD_BYTES//1024//1024}MB)'}, status=413)
 
-        fields, files = parse_multipart(handler.rfile, content_type, content_length)
+        fields, files = parse_multipart(handler.rfile, content_type, content_length, handler)
         session_id = fields.get('session_id', '')
         subpath = fields.get('path', '')
 

@@ -2728,6 +2728,75 @@ function _dataImageHtml(ref, altText){
   return `<img class="msg-media-img" src="${esc(ref)}" alt="${esc(altText||'image')}" loading="lazy">`;
 }
 
+// ── MEDIA: path matching (shared with the streaming path in messages.js) ──────
+// A MEDIA path may legitimately contain spaces:
+//   MEDIA:/home/u/vault/Meeting Notes/2026-07-29 - SDE Focus Group.md
+// The original `[^\s\)\]]+` class stopped at the first space, so the artifact
+// card was built from the truncated path ("Meeting"), rendered the wrong
+// basename, and the remainder of the real path leaked into the bubble as raw
+// prose beside the card.
+//
+// Widening cannot be unbounded — greedy space-tolerance would swallow trailing
+// prose ("MEDIA:/tmp/a.png looks good") and glue an adjacent tag
+// ("MEDIA:/a.png MEDIA:/b.png") into one invalid path, which is the bug class
+// the Python gateway already hit (#68773). So the bare form is anchored on a
+// file extension and tempered: it crosses single spaces only while still
+// reaching a `.ext`, never crosses a newline, and never crosses a following
+// MEDIA: keyword. Extension-less paths still match via the fallback branch, so
+// nothing that worked before stops working.
+//
+// Keep this the SINGLE source of truth for MEDIA path shape. messages.js reuses
+// it so the streamed and settled renderings of one token stay byte-identical.
+//
+// Exposed as a FUNCTION, not a const, because the test harnesses in tests/*.py
+// white-box-extract production code by `function <name>(` declaration and eval
+// it in isolation (see tests/test_data_uri_images.py). A bare top-level const is
+// invisible to that extractor, so any renderMd harness would die with
+// "_MEDIA_PATH_SRC is not defined". When you add a helper that renderMd calls,
+// add it to the eval list in every harness that extracts renderMd.
+function _mediaPathSrc(){
+  // One token: no whitespace, and none of the delimiters that close a token.
+  const tok = String.raw`[^\s\)\]]+`;
+  // Space-joined continuation, guarded so a following MEDIA: keyword is never
+  // absorbed into the current path.
+  //
+  // The extension uses `+` rather than a counted quantifier on purpose, and the
+  // comments here deliberately avoid brace characters: the test harnesses
+  // extract production functions by counting brace depth (tests/*.py
+  // `extractFunc`), and that counter does not skip string literals OR comments,
+  // so any unmatched brace anywhere in this function truncates the extraction
+  // mid-literal. A hex escape is not a workaround either — inside a regex it
+  // denotes a literal brace character rather than a quantifier. The trailing
+  // boundary already bounds the run, so `+` costs nothing.
+  const ext = String.raw`[A-Za-z0-9]+`;
+  const bare = String.raw`(?!MEDIA:)${tok}?(?:[^\S\n](?!MEDIA:)${tok}?)*?\.${ext}`;
+  // Bare matches must end at whitespace, a closing delimiter, a glued MEDIA:
+  // keyword, or end of input — never mid-prose. The closing-brace delimiter is
+  // spelled as the hex escape below for the brace-counting reason above.
+  const boundary = String.raw`(?=[\s\)\]\x7d"'*_,;:]|MEDIA:|$)`;
+  // Quoted form wins first (can hold any character), then the bounded spaced
+  // form, then the original no-space fallback for extension-less paths.
+  return String.raw`"[^"\n]+"|'[^'\n]+'|(?:${bare})${boundary}|${tok}`;
+}
+
+/** Global matcher for MEDIA: tokens. Fresh instance per call — a shared /g regex
+ *  carries lastIndex between callers and silently skips matches. */
+function _mediaTokenRe(){
+  return new RegExp(String.raw`MEDIA:(${_mediaPathSrc()})`, 'g');
+}
+
+/** Anchored single-token matcher (streaming chunk === exactly one MEDIA token). */
+function _mediaTokenAnchoredRe(){
+  return new RegExp(String.raw`^MEDIA:(${_mediaPathSrc()})$`);
+}
+
+/** Strip surrounding quotes from a captured MEDIA path. */
+function _unquoteMediaRef(ref){
+  const value = String(ref || '').trim();
+  const quote = value[0];
+  return (quote === '"' || quote === "'") && value.endsWith(quote) ? value.slice(1, -1) : value;
+}
+
 // Markdown image syntax ![alt](url) → HTML. https:// keeps the historical direct
 // <img>; file:// and bare data:image/ URIs route through the same helpers the
 // MEDIA: pipeline uses, so ![x](file:///p.png) renders the artifact card instead
@@ -4639,7 +4708,6 @@ function renderModelDropdown(){
         if(configuredRankA!==configuredRankB) return configuredRankA-configuredRankB;
         return a.name.localeCompare(b.name);
       });
-    const configuredIds=new Set(configuredModels.map(m=>m.value));
     const configuredSemanticKeys=new Set(configuredModels.map(m=>`${_configuredProviderKey(m)}::${_configuredModelKey(m)}`));
     const _effectiveHiddenCount=(groupKey)=>_modelData.filter(m=>
       m.groupKey===groupKey
@@ -4651,29 +4719,40 @@ function renderModelDropdown(){
     dd.appendChild(_searchRow);
     dd.appendChild(_custSep);
     dd.appendChild(_custRow);
-    if(configuredModels.length){
+    // Badged models render inside their own provider group, so the pinned
+    // section only carries ORPHANS: a configured model whose provider has no
+    // group in the picker (e.g. a fallback on a provider that serves no
+    // catalogue). Without this they would render nowhere and be unreachable.
+    const _groupedProviderKeys=new Set(
+      _groupOrder
+        .map(k=>String((_groupMeta.get(k)||{}).providerId||'').toLowerCase())
+        .filter(Boolean)
+    );
+    const orphanConfigured=configuredModels.filter(m=>{
+      const provider=_configuredProviderKey(m);
+      if(provider&&_groupedProviderKeys.has(provider)) return false;
+      // Already rendered as a row in some group? then it is not an orphan.
+      return !_modelData.some(e=>e.groupKey&&e.value===m.value);
+    });
+    if(orphanConfigured.length){
       const configuredHeading=document.createElement('div');
       configuredHeading.className='model-group';
       configuredHeading.textContent=t('model_group_configured')||'Configured';
       dd.appendChild(configuredHeading);
-      // 为了显示原始ID，建立 badgeKeyMap: badge对象->原始key
-      const badgeKeyMap = new Map();
-      for(const [k, v] of Object.entries(_badgeMap)){
-        badgeKeyMap.set(v, k);
-      }
-      for(const m of configuredModels){
+      const badgeKeyMap=new Map();
+      for(const [k,v] of Object.entries(_badgeMap)) badgeKeyMap.set(v,k);
+      for(const m of orphanConfigured){
         const row=document.createElement('div');
         row.className='model-opt'+(_isSelectedModelRow(m)?' active':'');
-        let badgeLabel = '';
-        let modelName = m.name;
-        if (m.badge) {
-          // 直接用badge的原始key（即config.yaml里的ID）
-          const rawId = badgeKeyMap.get(m.badge) || m.value || m.badge.label || 'Configured';
-          badgeLabel = rawId;
-          modelName = rawId; // model-opt-name直接用原始ID
+        let badgeLabel='';
+        let modelName=m.name;
+        if(m.badge){
+          const rawId=badgeKeyMap.get(m.badge)||m.value||m.badge.label||'Configured';
+          badgeLabel=rawId;
+          modelName=rawId;
           if(m.badge.provider){
             const providerName=m.badge.provider.replace(/^custom:/,'').split('/')[0];
-            badgeLabel += ` (${providerName})`;
+            badgeLabel+=` (${providerName})`;
           }
         }
         const badgeHtml=m.badge?`<span class="model-opt-badge model-opt-badge--${esc(m.badge.role||'configured')}">${esc(badgeLabel)}</span>`:'';
@@ -4688,7 +4767,6 @@ function renderModelDropdown(){
       const hiddenCount=_effectiveHiddenCount(groupKey);
       const groupRows=_modelData.filter(m=>
         m.groupKey===groupKey
-        && !configuredIds.has(m.value)
         && !m.endpointErrorOnly
         && matches(m)
         && (!m.hiddenByDefault || !!term)
@@ -5224,6 +5302,7 @@ function _reasoningEffortContext(){
     provider=_modelStateForSelect(sel, model).model_provider||'';
   }
   const ctx={};
+  if(S&&S.session&&S.session.session_id) ctx.session_id=S.session.session_id;
   if(model) ctx.model=model;
   if(provider) ctx.provider=provider;
   return ctx;
@@ -7648,8 +7727,8 @@ function renderMd(raw){
   // generated images) and replace them with inline <img> or download links.
   // Stashed so the path/URL is never processed as markdown.
   const media_stash=[];
-  s=s.replace(/MEDIA:([^\s\)\]]+)/g,(_,raw_ref)=>{
-    media_stash.push(raw_ref);
+  s=s.replace(_mediaTokenRe(),(_,raw_ref)=>{
+    media_stash.push(_unquoteMediaRef(raw_ref));
     return '\x00D'+(media_stash.length-1)+'\x00';
   });
   // ── End MEDIA stash ─────────────────────────────────────────────────────────

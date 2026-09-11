@@ -301,6 +301,10 @@ def t(
 
 
 MAX_BODY_BYTES = 20 * 1024 * 1024  # 20MB limit for non-upload POST bodies
+# Cap a single chunked-encoding chunk-size line. A well-formed line is a few
+# bytes ("1a3f\r\n"); a bounded readline stops a malicious peer from sending an
+# unbounded line with no newline and exhausting memory.
+_CHUNK_LINE_LIMIT = 1024
 
 
 # ── Credential redaction ──────────────────────────────────────────────────────
@@ -1244,8 +1248,71 @@ def redact_session_data(session_dict: dict) -> dict:
     return result
 
 
+def _read_chunked_body(handler, max_bytes: int) -> bytes:
+    """Decode an HTTP/1.1 ``Transfer-Encoding: chunked`` request body.
+
+    Reverse proxies can re-frame a Content-Length POST as chunked. Amazon
+    Tunnels does this, so a body read that trusts Content-Length alone sees
+    zero bytes and every required field looks absent. The symptom is a 400
+    "Missing required field(s): session_id" that only appears through the
+    tunnel and never on direct localhost access.
+
+    Enforces ``max_bytes`` across the sum of all chunks, so chunking cannot
+    bypass the body-size cap.
+    """
+    chunks = []
+    total = 0
+    while True:
+        line = handler.rfile.readline(_CHUNK_LINE_LIMIT + 1)
+        if not line:
+            raise ValueError('Malformed chunked body: unexpected end of stream')
+        if len(line) > _CHUNK_LINE_LIMIT:
+            handler.close_connection = True
+            raise ValueError('Malformed chunked body: chunk-size line too long')
+        # Strip any chunk extensions (";name=value") before parsing the size.
+        size_token = line.split(b';', 1)[0].strip()
+        try:
+            size = int(size_token, 16)
+        except ValueError:
+            handler.close_connection = True
+            raise ValueError(f'Malformed chunked body: bad chunk size {size_token!r}')
+        if size < 0:
+            handler.close_connection = True
+            raise ValueError('Malformed chunked body: negative chunk size')
+        if size == 0:
+            # Consume trailers up to the terminating blank line.
+            while True:
+                trailer = handler.rfile.readline(_CHUNK_LINE_LIMIT + 1)
+                if not trailer or trailer in (b'\r\n', b'\n'):
+                    break
+            break
+        total += size
+        if total > max_bytes:
+            handler.close_connection = True
+            raise ValueError(f'Request body too large (>{max_bytes} bytes, max {max_bytes})')
+        data = handler.rfile.read(size)
+        if data is None or len(data) != size:
+            raise ValueError('Malformed chunked body: truncated chunk')
+        chunks.append(data)
+        # Each chunk is followed by CRLF, which must be consumed.
+        handler.rfile.read(2)
+    return b''.join(chunks)
+
+
 def read_body(handler) -> dict:
-    """Read and JSON-parse a POST request body (capped at 20MB)."""
+    """Read and JSON-parse a POST request body (capped at 20MB).
+
+    Handles both Content-Length and Transfer-Encoding: chunked framing.
+    Chunked must be checked first, because RFC 7230 gives Transfer-Encoding
+    precedence and a proxy can send both headers.
+    """
+    transfer_encoding = (handler.headers.get('Transfer-Encoding') or '').strip().lower()
+    if 'chunked' in transfer_encoding:
+        raw = _read_chunked_body(handler, MAX_BODY_BYTES) or b'{}'
+        try:
+            return _json.loads(raw)
+        except Exception:
+            return {}
     raw_length = handler.headers.get('Content-Length', 0)
     try:
         length = int(raw_length)
@@ -1421,3 +1488,45 @@ def clear_profile_cookie(handler) -> None:
     cookie[cookie_name]['samesite'] = 'Lax'
     cookie[cookie_name]['max-age'] = '0'
     handler.send_header('Set-Cookie', cookie[cookie_name].OutputString())
+
+# ── MEDIA: token path matching (shared) ──────────────────────────────────────
+# A MEDIA path may legitimately contain spaces:
+#   MEDIA:/home/u/vault/Meeting Notes/2026-07-29 - SDE Focus Group.md
+# A ``[^\s)\]]+`` class stops at the first space, which truncates the path.
+# Frontend ui.js/messages.js used to do this (the artifact card rendered the
+# wrong basename and the tail leaked into the bubble as prose); the same class
+# lives in the /api/media allow-list and the public-share inliner, where a
+# truncated capture silently fails to match the real on-disk path and the
+# artifact becomes unviewable.
+#
+# Widening cannot be unbounded: greedy space tolerance would swallow trailing
+# prose ("MEDIA:/tmp/a.png looks good") and glue an adjacent tag
+# ("MEDIA:/a.png MEDIA:/b.png") into one invalid path. The bare form is
+# therefore anchored on a file extension and tempered -- it crosses single
+# spaces only while still reaching a ``.ext``, never crosses a newline, and
+# carries a ``(?!MEDIA:)`` guard on each continuation token so the next token
+# is never absorbed. Extension-less paths still match via the no-space
+# fallback, so nothing that resolved before stops resolving.
+#
+# Keep this the single source of truth for MEDIA path shape on the Python side;
+# it mirrors ``_mediaPathSrc()`` in static/ui.js.
+_MEDIA_TOKEN_BARE = (
+    r"(?!MEDIA:)[^\s)\]]+?(?:[^\S\n](?!MEDIA:)[^\s)\]]+?)*?\.[A-Za-z0-9]+"
+)
+_MEDIA_TOKEN_BOUNDARY = r"(?=[\s)\]}\"'*_,;:]|MEDIA:|$)"
+
+
+def media_token_pattern(extra_exclude: str = "", exclude_urls: bool = False) -> str:
+    """Return the MEDIA: path-capture pattern (one capture group).
+
+    ``extra_exclude`` adds characters to the no-space fallback's excluded set
+    (the share inliner also excludes ``>``). ``exclude_urls`` skips
+    ``MEDIA:http(s)://...`` so external images pass through untouched.
+    """
+    url_guard = r"(?!https?://)" if exclude_urls else ""
+    fallback = r"[^\s)\]" + extra_exclude + r"]+"
+    bare = _MEDIA_TOKEN_BARE
+    if extra_exclude:
+        bare = bare.replace(r"[^\s)\]]", r"[^\s)\]" + extra_exclude + r"]")
+    return r"MEDIA:" + url_guard + r"((?:" + bare + r")" + _MEDIA_TOKEN_BOUNDARY + r"|" + fallback + r")"
+
